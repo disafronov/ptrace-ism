@@ -8,11 +8,12 @@ A standalone, from-scratch Linux x86_64 tracer (a "mini strace") driven
 directly by the ptrace(2) syscall. It execs a target `command` as its own child
 and ptraces it, observing *every* execve()/execveat() syscall entry across the
 entire process tree (fork / vfork / clone, including threaded children), applies
-a policy decision to each exec, and optionally denies blocked execs at the
+a policy decision to each exec, and denies matching execs: the root command is
+refused before exec (the child exits 126), descendant execs are blocked at the
 syscall entry (silent exit-126 stub, with EACCES/ENOSYS fallbacks).
 
 It is written to **A/B-validate** a proposed replacement for the GDB-based
-engine in `<repo>/ptrace-ism`.
+engine.
 
 WHY IT EXISTS (the problem it proves)
 -------------------------------------
@@ -31,8 +32,8 @@ Prototype, for A/B validation before any integration.
 Scope / non-goals
 -----------------
 * Linux x86_64 only.
-* Python 3 stdlib only (os, sys, ctypes, time, signal, math, dataclasses,
-  pathlib).
+* Python 3 stdlib only (ctypes, errno, json, math, os, signal, stat, sys,
+  time, dataclasses, pathlib).
 * Observes execve(2) + execveat(2) at syscall ENTRY using
   PTRACE_GET_SYSCALL_INFO.
 * OPT-IN run timeout: `PTRACE_ISM_TIMEOUT=<seconds>` arms a SIGALRM-based
@@ -402,7 +403,9 @@ def decide(event: ExecEvent) -> str:
 # Trace output (mirrors ptrace-ism's _trace / exec line format for A/B)
 # --------------------------------------------------------------------------- #
 class Tracer:
-    """Owns trace routing: an optional append-file, else stdout (flushed)."""
+    """Owns trace routing: an optional append-file; otherwise stderr under
+    PTRACE_ISM_DEBUG=1, stdout only for forced lines (deny), silent by
+    default."""
 
     def __init__(self) -> None:
         self.trace_file = os.environ.get("PTRACE_ISM_TRACE_FILE")
@@ -623,7 +626,9 @@ def enforce_deny(
        fails (write_mem returns False), force orig_rax to an invalid syscall
        number so the kernel returns -ENOSYS.
 
-    Returns the mode actually used, or "failed".
+    Returns "EACCES" when the exec path was rewritten to the deny stub or to
+    "/" (the label does not distinguish the two), "ENOSYS" when the syscall
+    number was replaced, or "failed" if even set_regs failed.
     """
     # execve: path in %rdi; execveat: path in %rsi.
     path_ptr = regs.di if event.syscall == "execve" else regs.si
