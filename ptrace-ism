@@ -34,8 +34,8 @@ Scope / non-goals
 * Python 3 stdlib only (os, sys, ctypes, time, signal, dataclasses, pathlib).
 * Observes execve(2) + execveat(2) at syscall ENTRY using
   PTRACE_GET_SYSCALL_INFO.
-* Policy: temporary hardcoded demo rule (deny `git push`) for A/B parity with
-  ptrace-ism's `decide()`.
+ * Policy: argv deny rules loaded from a JSON config file (no built-in deny
+ * rules; see _get_deny_rules()), for A/B parity with ptrace-ism's `decide()`.
 * Enforcement at syscall entry: substitute the exec path with a tiny deny stub
   that silently exits 126 (no parent-shell error line); fallback to rewriting
   the path to "/" (kernel -> EACCES) and, last, forcing an invalid syscall
@@ -241,8 +241,6 @@ class ExecEvent:
     flags: int | None = None
 
 
-FALLBACK_DENY_RULES: list[list[str]] = [["git", "push"]]
-
 # Descendant-exec deny enforcement: instead of failing the exec with EACCES
 # (which makes the parent shell print a confusing error line), the exec path
 # is replaced with a tiny stub script that silently exits with the canonical
@@ -259,13 +257,21 @@ _deny_rules: list[list[str]] | None = None
 
 
 def _get_deny_rules() -> list[list[str]]:
-    """Load deny rules from the config file (cached), else built-in fallback.
+    """Load deny rules from the config file (cached).
 
     Config: JSON file, default ~/.config/ptrace-ism.json, overridable with
     the PTRACE_ISM_CONFIG env var. Schema: {"deny": [["git", "push"], ...]}.
     A rule is a list of argv tokens; argv[0] is matched by basename.
-    On missing/unreadable/invalid config the built-in fallback rules are used
-    so the sandbox keeps failing closed (deny git push).
+
+    Semantics (there are no built-in fallback deny rules):
+    * Missing config file (FileNotFoundError) -> no deny rules (allow all).
+    * Completely empty config file (0 bytes or whitespace-only) -> no deny
+      rules (allow all); it is NOT treated as broken/invalid JSON.
+    * Empty/missing/invalid-only "deny" list -> no deny rules (allow all).
+    * Unreadable config (other OSError, e.g. PermissionError), invalid JSON,
+      or valid JSON that is not an object -> refuse to run: raise SystemExit
+      with a message naming the config path and the problem. The tool must
+      NOT silently continue.
     """
     global _deny_rules
     if _deny_rules is not None:
@@ -273,31 +279,63 @@ def _get_deny_rules() -> list[list[str]]:
     config_path = os.environ.get("PTRACE_ISM_CONFIG") or str(
         Path.home() / ".config" / "ptrace-ism.json"
     )
-    rules: list[list[str]] | None = None
     try:
         with open(config_path, "r", encoding="utf-8") as stream:
-            data = json.load(stream)
-        raw_rules = data.get("deny", [])
-        cleaned = [
-            list(rule)
-            for rule in raw_rules
-            if isinstance(rule, list) and rule
-            and all(isinstance(token, str) for token in rule)
-        ]
-        if cleaned:
-            rules = cleaned
-    except (OSError, ValueError) as exc:
-        trace.debug_log(f"config {config_path} not usable ({exc})")
-    if rules is None:
-        rules = FALLBACK_DENY_RULES
-        trace.debug_log(
-            f"using built-in fallback deny rules: {rules} "
-            f"(config {config_path} missing or invalid)"
+            content = stream.read()
+    except FileNotFoundError:
+        # No config file: open-by-default, no deny rules (allow all).
+        trace.debug_log(f"no config found at {config_path}; no deny rules")
+        _deny_rules = []
+        return _deny_rules
+    except OSError as exc:
+        # Unreadable config (e.g. PermissionError): refuse to run.
+        raise SystemExit(
+            f"ptrace-ism: config {config_path} is invalid: {exc}"
         )
-    else:
-        trace.debug_log(f"config deny rules loaded from {config_path}: {rules}")
-    _deny_rules = rules
-    return rules
+    except ValueError as exc:
+        # UnicodeDecodeError (a ValueError subclass) from stream.read(): the
+        # file is not valid UTF-8 text and therefore not a usable config.
+        # This preserves the old behavior where the read inside json.load()
+        # raised the same exception under this handler.
+        raise SystemExit(
+            f"ptrace-ism: config {config_path} is invalid: {exc}"
+        )
+
+    if content.strip() == "":
+        # A completely empty (0-byte or whitespace-only) config file is a
+        # valid config meaning "deny nothing": allow everything. It must NOT
+        # be treated as broken/invalid JSON (which would refuse to run).
+        trace.debug_log(f"config {config_path} is empty; no deny rules")
+        _deny_rules = []
+        return _deny_rules
+
+    try:
+        data = json.loads(content)
+    except ValueError as exc:
+        # json.JSONDecodeError (a ValueError subclass): invalid JSON.
+        raise SystemExit(
+            f"ptrace-ism: config {config_path} is invalid: {exc}"
+        )
+
+    if not isinstance(data, dict):
+        # Valid JSON that is not an object (e.g. [1,2,3] or "str").
+        raise SystemExit(
+            f"ptrace-ism: config {config_path} is invalid: "
+            f"expected a JSON object, got {type(data).__name__}"
+        )
+
+    raw_rules = data.get("deny", [])
+    cleaned = [
+        list(rule)
+        for rule in raw_rules
+        if isinstance(rule, list) and rule
+        and all(isinstance(token, str) for token in rule)
+    ]
+    # An empty/missing/invalid-only "deny" list is a valid config meaning
+    # "deny nothing": allow everything.
+    trace.debug_log(f"config deny rules loaded from {config_path}: {cleaned}")
+    _deny_rules = cleaned
+    return cleaned
 
 
 def decide(event: ExecEvent) -> str:

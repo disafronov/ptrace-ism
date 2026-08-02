@@ -44,8 +44,15 @@ Schema: `{"deny": [[argv0, arg1, ...], ...]}`. Matching is prefix-based and
 argv[0] is compared by basename, so `["git", "push"]` also blocks
 `git push origin main` and `/usr/bin/git push ...`.
 
-A missing, unreadable, or invalid config falls back to the built-in deny
-rule (git push) so the sandbox keeps failing closed.
+There are no built-in deny rules:
+
+- Missing config file: no deny rules, everything is allowed.
+- A completely empty config file (0 bytes or whitespace-only), an empty `deny`
+  list (or a config whose rules are all invalid): no deny rules, everything is
+  allowed.
+- Invalid JSON, an unreadable config file, or valid JSON that is not an
+  object: the tool refuses to run and exits non-zero with an error naming the
+  config path and the problem.
 
 ## Behavior notes
 
