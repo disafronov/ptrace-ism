@@ -23,7 +23,7 @@ Place the script on PATH and make it executable:
 
 ## Usage
 
-    ptrace-ism [options] -- <command> [args...]
+    ptrace-ism <command> [args...]
     ptrace-ism git push
     ptrace-ism bash -c 'git push && echo done'
 
@@ -70,7 +70,14 @@ There are no built-in deny rules:
 ## Development
 
     make test       # syntax + unit tests (no ptrace needed)
-    make storm      # fork/exec storm test with pytest-xdist
+    make storm      # 40 storm tests: ptrace-ism wrapper under a fork/exec storm
 
-`make storm` must run on a real host: ptrace may be restricted in containers
-and sandboxes.
+`make storm` runs the 40 storm tests in `tests/test_storm_*.py` with pytest-xdist
+(`pytest -n 16`). Each file executes the `ptrace-ism` wrapper around a command
+(`/usr/bin/uname -p`, `/bin/echo x`) and asserts the tool's `[ptrace-ism] summary`
+stderr line, so the storm fires 80 real ptrace-ism invocations. It must run on a
+real host: the storm tests use ptrace through the tool, which may be restricted
+in containers and sandboxes.
+
+`make storm` needs pytest and pytest-xdist:
+`python3 -m pip install pytest pytest-xdist`
