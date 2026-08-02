@@ -31,9 +31,14 @@ Prototype, VERSION "0.1-prototype", for A/B validation before any integration.
 Scope / non-goals
 -----------------
 * Linux x86_64 only.
-* Python 3 stdlib only (os, sys, ctypes, time, signal, dataclasses, pathlib).
+* Python 3 stdlib only (os, sys, ctypes, time, signal, math, dataclasses,
+  pathlib).
 * Observes execve(2) + execveat(2) at syscall ENTRY using
   PTRACE_GET_SYSCALL_INFO.
+* OPT-IN run timeout: `PTRACE_ISM_TIMEOUT=<seconds>` arms a SIGALRM-based
+  deadline that kills the traced tree and exits 124. Disabled by default:
+  unset / 0 / negative / invalid -> no timeout at all, the traced command
+  runs as long as it needs (transparent behavior).
  * Policy: argv deny rules loaded from a JSON config file (no built-in deny
  * rules; see _get_deny_rules()), for A/B parity with ptrace-ism's `decide()`.
 * Enforcement at syscall entry: substitute the exec path with a tiny deny stub
@@ -47,6 +52,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import json
+import math
 import os
 import signal
 import stat
@@ -110,19 +116,63 @@ PTRACE_SYSCALL_INFO_EXIT = 2
 # The high bit (0x80) flags "this is a syscall stop, not a real SIGTRAP".
 SYSCALL_SIGTRAP = signal.SIGTRAP | 0x80  # 0x85
 
-DEFAULT_TIMEOUT_SECONDS = 300.0
-
 # --------------------------------------------------------------------------- #
-# Timeout (SIGALRM)
+# Timeout (OPT-IN, SIGALRM)
 # --------------------------------------------------------------------------- #
-# Global flag: True once SIGALRM fires. The blocking waitpid in main_loop is
-# interrupted by the alarm (raising InterruptedError), which lets the timeout
-# teardown path run instead of hanging forever on an event-less wait.
+# Global flag: True once SIGALRM fires. Only meaningful while the OPT-IN
+# timeout is active (PTRACE_ISM_TIMEOUT > 0): the blocking waitpid in
+# main_loop is interrupted by the alarm (raising InterruptedError), which
+# lets the timeout teardown path run instead of hanging forever on an
+# event-less wait. When the timeout is disabled no alarm is ever armed, so
+# this flag can never be set.
 _ALRM_TIMED_OUT = False
 
 
+def _parse_timeout() -> float:
+    """Read the OPT-IN run timeout from PTRACE_ISM_TIMEOUT.
+
+    The timeout is DISABLED by default. Semantics:
+    * Env var unset/empty -> disabled (returns 0.0): no SIGALRM, no deadline;
+      the traced command runs as long as it needs.
+    * Value <= 0 (e.g. "0" or "-5") -> disabled (returns 0.0).
+    * A positive finite number ("10", "2.5") -> active with that many seconds.
+    * Invalid value (non-numeric, NaN, infinity) -> warn on stderr and treat
+      as disabled (returns 0.0). KISS choice: a bad value never refuses to
+      run, matching the tool's tolerant env handling.
+    """
+    raw = os.environ.get("PTRACE_ISM_TIMEOUT")
+    if not raw:
+        return 0.0
+    try:
+        timeout = float(raw)
+    except ValueError:
+        print(
+            f"[ptrace-ism] warning: ignoring invalid PTRACE_ISM_TIMEOUT "
+            f"{raw!r}; timeout disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0.0
+    if timeout <= 0:
+        # Explicit "0" (or a negative value) means disabled; documented.
+        return 0.0
+    if not math.isfinite(timeout):
+        # NaN / infinity are unusable as a deadline; warn and disable.
+        print(
+            f"[ptrace-ism] warning: ignoring invalid PTRACE_ISM_TIMEOUT "
+            f"{raw!r}; timeout disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0.0
+    return timeout
+
+
 def _on_alarm(signum: int, frame) -> None:
-    """SIGALRM handler: mark the run hung; the main loop handles teardown."""
+    """SIGALRM handler: mark the run hung; the main loop handles teardown.
+
+    Installed only while the OPT-IN timeout is active (see main_loop).
+    """
     global _ALRM_TIMED_OUT
     _ALRM_TIMED_OUT = True
     print(
@@ -677,8 +727,9 @@ class State:
         self.exec_events = 0
         self.denied = 0
         # Deterministic-timeout bookkeeping (see main_loop): start_time is set
-        # when the loop begins; timeout mirrors the configured loop timeout so
-        # the non-alarm fallback check at the top of each iteration works.
+        # when the loop begins; timeout mirrors the configured loop timeout
+        # (0.0 when the OPT-IN timeout is disabled). The main loop only runs
+        # the non-alarm deadline checks while timeout > 0.
         self.start_time: float = 0.0
         self.timeout: float = 0.0
 
@@ -1128,9 +1179,10 @@ def launch(command: str, args: list[str], state: State) -> None:
             os._exit(126)
         # Child: become tracee, then exec the target.
         _ptrace(PTRACE_TRACEME, 0, None, None)
-        # Do not inherit a stale SIGALRM timer (set by the tracer's main loop);
-        # the alarm must only interrupt the tracer's blocking waitpid, never
-        # the tracee.
+        # Do not inherit any SIGALRM timer from the tracer (when the OPT-IN
+        # timeout is active, the tracer's main loop arms a one-shot alarm
+        # before waitpid); the alarm must only interrupt the tracer's blocking
+        # waitpid, never the tracee.
         signal.alarm(0)
         # The exec-trap SIGTRAP from TRACEME is delivered at the exec of the
         # *target* (os.execvp triggers it). If exec fails we exit 127, or 126
@@ -1266,17 +1318,25 @@ def print_summary(state: State) -> None:
 
 
 def main_loop(state: State, timeout: float) -> bool:
-    """Blocking waitpid loop. Returns True if it ended naturally (empty set)."""
+    """Blocking waitpid loop. Returns True if it ended naturally (empty set).
+
+    The timeout is OPT-IN: when ``timeout <= 0`` (PTRACE_ISM_TIMEOUT unset,
+    zero, negative, or invalid) NO SIGALRM is armed and NO deadline checks
+    run -- the traced command runs as long as it needs (transparent).
+    When ``timeout > 0`` a one-shot SIGALRM is armed so the blocking waitpid
+    below becomes interruptible when no events arrive; without it, a hang
+    would block forever on waitpid and the timeout check would never run.
+    """
     global _ALRM_TIMED_OUT
-    # Install a SIGALRM handler + one-shot alarm so the blocking waitpid below
-    # becomes interruptible when no events arrive. Without this, a hang would
-    # block forever on waitpid and the timeout check would never run.
-    signal.signal(signal.SIGALRM, _on_alarm)
     _ALRM_TIMED_OUT = False
     if timeout > 0:
+        # Install a SIGALRM handler + one-shot alarm so the blocking waitpid
+        # below becomes interruptible when no events arrive. Without this, a
+        # hang would block forever on waitpid and the timeout check would
+        # never run.
+        signal.signal(signal.SIGALRM, _on_alarm)
         signal.alarm(max(1, int(timeout)))
 
-    deadline = time.monotonic() + timeout
     state.start_time = time.monotonic()
     state.timeout = timeout
 
@@ -1285,8 +1345,9 @@ def main_loop(state: State, timeout: float) -> bool:
         # one-shot SIGALRM only interrupts an in-progress waitpid; if the alarm
         # fired while an event was being dispatched, _ALRM_TIMED_OUT is set but
         # no alarm remains to wake the NEXT blocking waitpid (so it would block
-        # forever). This monotonic check covers that window directly.
-        if time.monotonic() - state.start_time > state.timeout:
+        # forever). This monotonic check covers that window directly. It only
+        # runs when the OPT-IN timeout is active (timeout > 0).
+        if timeout > 0 and time.monotonic() - state.start_time > state.timeout:
             print(
                 f"[ptrace-ism] FAIL/HANG: timeout after {timeout}s",
                 file=sys.stderr,
@@ -1296,6 +1357,8 @@ def main_loop(state: State, timeout: float) -> bool:
             return False
         # PITFALL: blocking waitpid can raise InterruptedError; retry unless
         # the SIGALRM flag is set (in which case we tear down on timeout).
+        # When the timeout is disabled no alarm is armed, so _ALRM_TIMED_OUT
+        # can never be set and this branch cannot fire.
         try:
             wpid, status = os.waitpid(-1, 0)
         except InterruptedError:
@@ -1331,7 +1394,8 @@ def main_loop(state: State, timeout: float) -> bool:
 
         # In-wait iteration check (still useful when events keep arriving and
         # the alarm was cancelled/ignored for a path that never re-armed it).
-        if time.monotonic() > deadline:
+        # Only runs when the OPT-IN timeout is active (timeout > 0).
+        if timeout > 0 and time.monotonic() - state.start_time > state.timeout:
             print(
                 f"[ptrace-ism] FAIL/HANG: timeout after {timeout}s",
                 file=sys.stderr,
@@ -1382,7 +1446,7 @@ def usage() -> None:
         "env: PTRACE_ISM_TRACE_FILE=<path>  append trace lines to a file "
         "(default: none)\n"
         "     PTRACE_ISM_DEBUG=1           verbose trace and diagnostics to stderr\n"
-        "     PTRACE_ISM_TIMEOUT=<seconds> loop timeout (default 300)\n"
+        "     PTRACE_ISM_TIMEOUT=<seconds> OPT-IN loop timeout (disabled unless set)\n"
         "     PTRACE_ISM_CONFIG=<path>     rules JSON (default: ~/.config/ptrace-ism.json)",
         file=sys.stderr,
     )
@@ -1400,13 +1464,9 @@ def main(argv: list[str]) -> int:
         usage()
         return 2
 
-    timeout = DEFAULT_TIMEOUT_SECONDS
-    raw = os.environ.get("PTRACE_ISM_TIMEOUT")
-    if raw:
-        try:
-            timeout = float(raw)
-        except ValueError:
-            timeout = DEFAULT_TIMEOUT_SECONDS
+    # OPT-IN run timeout: disabled (0.0) unless PTRACE_ISM_TIMEOUT is set to a
+    # positive number; see _parse_timeout() for the exact semantics.
+    timeout = _parse_timeout()
 
     state = State()
 

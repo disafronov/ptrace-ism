@@ -32,7 +32,11 @@ Environment:
 - `PTRACE_ISM_CONFIG` — path to rules JSON (default `~/.config/ptrace-ism.json`)
 - `PTRACE_ISM_TRACE_FILE` — append the full trace to a file
 - `PTRACE_ISM_DEBUG=1` — verbose trace and diagnostics to stderr
-- `PTRACE_ISM_TIMEOUT` — seconds before teardown
+- `PTRACE_ISM_TIMEOUT` — OPT-IN run timeout in seconds (default: off). The
+  timeout is disabled unless the variable is set to a positive number:
+  absent, `0`, a negative value, or an invalid value all mean "no timeout" —
+  the traced command runs as long as it needs. When active, expiry kills the
+  traced process tree and exits 124.
 
 ## Configuration
 
