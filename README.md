@@ -9,6 +9,16 @@ before exec (exit 126), descendant execs are blocked at the syscall entry.
 Python 3 stdlib only. A from-scratch replacement for an earlier GDB-based
 engine (which lost seccomp dispatch under fork/exec storms).
 
+> **Disclaimer: PROTOTYPE, not a security boundary.** ptrace-ism is a
+> demonstration/PROTOTYPE for A/B validation, not a hardened security sandbox.
+> Its deny decision is based on argv read from the tracee's memory via
+> `/proc/pid/mem`, which is a classic time-of-check/time-of-use (TOCTOU) race
+> between check and exec. The matching (basename argv[0] plus a prefix) can be
+> trivially bypassed, for example with global git options such as `git -C` or
+> execvp argv[0] tricks. Enforcement rewrites the exec path or the syscall
+> number and is not kernel-level isolation. Do not rely on it as a security
+> boundary in production.
+
 ## Requirements
 
 - Linux x86_64
