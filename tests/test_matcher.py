@@ -60,6 +60,30 @@ def decide_argv(argv: list[str]) -> str:
     return ptrace_ism.decide(event(argv))
 
 
+def expect_refused(name: str, argv: list[str]) -> None:
+    """Assert the tool refuses to run: SystemExit with a non-zero exit code.
+
+    Also asserts the refusal is NOT a silent allow: a normal decide() return
+    (any decision) fails the test.
+    """
+    reset_config()
+    try:
+        got = ptrace_ism.decide(event(argv))
+    except SystemExit as exc:
+        code = exc.code
+        ok = code not in (None, 0) and (
+            not isinstance(code, str) or "config" in code
+        )
+        print(
+            f"[{'ok' if ok else 'FAIL'}] {name}: refused with "
+            f"SystemExit({code!r})"
+        )
+        if not ok:
+            raise SystemExit(1)
+        return
+    raise SystemExit(f"[FAIL] {name}: did not refuse; decided {got!r}")
+
+
 def check(name: str, got: str, want: str) -> None:
     ok = got == want
     print(f"[{'ok' if ok else 'FAIL'}] {name}: got {got!r}, want {want!r}")
@@ -89,12 +113,100 @@ def main() -> int:
     finally:
         os.unlink(cfg)
 
-    # Missing config -> built-in fallback still denies git push (fail-closed).
-    os.environ.pop("PTRACE_ISM_CONFIG", None)
-    check("fallback deny git push (no config)", decide_argv(["git", "push"]), "deny")
-    check("fallback allow git pull (no config)", decide_argv(["git", "pull"]), "allow")
+    # Empty config {"deny": []} -> no deny rules -> allow all.
+    cfg_empty = write_config({"deny": []})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_empty
+    try:
+        check(
+            "allow git push (empty deny list)",
+            decide_argv(["git", "push"]),
+            "allow",
+        )
+        check(
+            "allow git pull (empty deny list)",
+            decide_argv(["git", "pull"]),
+            "allow",
+        )
+    finally:
+        os.unlink(cfg_empty)
 
-    # Broken JSON -> fallback (fail-closed).
+    # Completely empty config file (0 bytes or whitespace-only) -> no deny
+    # rules -> allow all; it must NOT be treated as broken/invalid JSON, so
+    # the tool must NOT refuse to run (a SystemExit here would fail the test).
+    fd, cfg_empty_file = tempfile.mkstemp(
+        prefix="ptrace-ism-empty-", suffix=".json", dir=str(ROOT)
+    )
+    os.write(fd, b" \t\n  ")
+    os.close(fd)
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_empty_file
+    try:
+        check(
+            "allow git push (empty config file)",
+            decide_argv(["git", "push"]),
+            "allow",
+        )
+        # Truly 0-byte file: truncate the same config and re-decide.
+        with open(cfg_empty_file, "w", encoding="utf-8"):
+            pass
+        check(
+            "allow git push (0-byte config file)",
+            decide_argv(["git", "push"]),
+            "allow",
+        )
+    finally:
+        os.unlink(cfg_empty_file)
+        os.environ.pop("PTRACE_ISM_CONFIG", None)
+
+    # Missing config (env unset, default file absent) -> no deny rules, allow all.
+    # Isolate from any real ~/.config/ptrace-ism.json on the machine: the
+    # default path is $HOME/.config/ptrace-ism.json, so temporarily point HOME
+    # at a fresh empty temp dir (no .config -> FileNotFoundError -> rules []).
+    os.environ.pop("PTRACE_ISM_CONFIG", None)
+    saved_home = os.environ.get("HOME")
+    temp_home = tempfile.mkdtemp(prefix="ptrace-ism-home-")
+    os.environ["HOME"] = temp_home
+    try:
+        check(
+            "allow git push (no config)",
+            decide_argv(["git", "push"]),
+            "allow",
+        )
+        check(
+            "allow git pull (no config)",
+            decide_argv(["git", "pull"]),
+            "allow",
+        )
+    finally:
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+        # decide_argv() already resets the config cache per call; reset again
+        # so no later case inherits rules loaded under the temp HOME.
+        reset_config()
+        try:
+            os.rmdir(temp_home)
+        except OSError:
+            pass
+
+    # PTRACE_ISM_CONFIG pointing at a nonexistent file -> allow all (no rules).
+    nonexistent = str(ROOT / "no-such-ptrace-ism-config.json")
+    try:
+        os.unlink(nonexistent)
+    except FileNotFoundError:
+        pass
+    os.environ["PTRACE_ISM_CONFIG"] = nonexistent
+    try:
+        check(
+            "allow git push (nonexistent config path)",
+            decide_argv(["git", "push"]),
+            "allow",
+        )
+    finally:
+        os.environ.pop("PTRACE_ISM_CONFIG", None)
+
+    # Broken JSON -> the tool refuses to run (SystemExit); it must NOT silently
+    # allow.
     fd, cfg2 = tempfile.mkstemp(
         prefix="ptrace-ism-broken-", suffix=".json", dir=str(ROOT)
     )
@@ -102,9 +214,17 @@ def main() -> int:
     os.close(fd)
     os.environ["PTRACE_ISM_CONFIG"] = cfg2
     try:
-        check("broken config falls back to deny", decide_argv(["git", "push"]), "deny")
+        expect_refused("broken config refuses to run", ["git", "push"])
     finally:
         os.unlink(cfg2)
+
+    # Valid JSON that is not an object -> refuses to run (SystemExit).
+    cfg_list = write_config([1, 2, 3])
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_list
+    try:
+        expect_refused("non-object config refuses to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_list)
 
     print("OK: all matcher unit tests passed")
     return 0
