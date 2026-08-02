@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for ptrace-ism config loading and the argv matcher.
+"""Unit tests for ptrace-ism config loading, the argv matcher, and OPT-IN
+timeout parsing.
 
 Import-based (no ptrace): runs anywhere Python 3 is available. The script is
 loaded by path via an explicit SourceFileLoader (its filename contains a
@@ -60,6 +61,26 @@ def decide_argv(argv: list[str]) -> str:
     return ptrace_ism.decide(event(argv))
 
 
+def parse_timeout(raw: str | None) -> float:
+    """Call ptrace_ism._parse_timeout() with a controlled PTRACE_ISM_TIMEOUT.
+
+    ``None`` means the env var is unset. The caller's env var is restored
+    afterwards so timeout cases cannot leak into config cases (or vice versa).
+    """
+    saved = os.environ.get("PTRACE_ISM_TIMEOUT")
+    if raw is None:
+        os.environ.pop("PTRACE_ISM_TIMEOUT", None)
+    else:
+        os.environ["PTRACE_ISM_TIMEOUT"] = raw
+    try:
+        return ptrace_ism._parse_timeout()
+    finally:
+        if saved is None:
+            os.environ.pop("PTRACE_ISM_TIMEOUT", None)
+        else:
+            os.environ["PTRACE_ISM_TIMEOUT"] = saved
+
+
 def expect_refused(name: str, argv: list[str]) -> None:
     """Assert the tool refuses to run: SystemExit with a non-zero exit code.
 
@@ -84,7 +105,7 @@ def expect_refused(name: str, argv: list[str]) -> None:
     raise SystemExit(f"[FAIL] {name}: did not refuse; decided {got!r}")
 
 
-def check(name: str, got: str, want: str) -> None:
+def check(name: str, got: object, want: object) -> None:
     ok = got == want
     print(f"[{'ok' if ok else 'FAIL'}] {name}: got {got!r}, want {want!r}")
     if not ok:
@@ -225,6 +246,16 @@ def main() -> int:
         expect_refused("non-object config refuses to run", ["git", "push"])
     finally:
         os.unlink(cfg_list)
+
+    # PTRACE_ISM_TIMEOUT: OPT-IN run timeout. Unset/empty/0/negative/invalid
+    # -> disabled (0.0); a positive number -> active with that many seconds.
+    check("timeout unset -> disabled", parse_timeout(None), 0.0)
+    check("timeout empty -> disabled", parse_timeout(""), 0.0)
+    check("timeout 0 -> disabled", parse_timeout("0"), 0.0)
+    check("timeout negative -> disabled", parse_timeout("-5"), 0.0)
+    check("timeout invalid -> disabled", parse_timeout("abc"), 0.0)
+    check("timeout positive int", parse_timeout("10"), 10.0)
+    check("timeout positive float", parse_timeout("2.5"), 2.5)
 
     print("OK: all matcher unit tests passed")
     return 0
