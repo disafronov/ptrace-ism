@@ -26,7 +26,7 @@ prove that reliability under exactly that storm.
 
 STATUS
 ------
-Prototype, VERSION "0.1-prototype", for A/B validation before any integration.
+Prototype, for A/B validation before any integration.
 
 Scope / non-goals
 -----------------
@@ -60,8 +60,6 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
-VERSION = "0.1-prototype"
 
 # --------------------------------------------------------------------------- #
 # Constants (Linux x86_64)
@@ -110,7 +108,6 @@ INVALID_SYSCALL_NR = 9999
 
 # PTRACE_GET_SYSCALL_INFO `op` values.
 PTRACE_SYSCALL_INFO_ENTRY = 1
-PTRACE_SYSCALL_INFO_EXIT = 2
 
 # Signal that reports a suppressed syscall-stop when TRACESYSGOOD is set.
 # The high bit (0x80) flags "this is a syscall stop, not a real SIGTRAP".
@@ -143,27 +140,21 @@ def _parse_timeout() -> float:
     raw = os.environ.get("PTRACE_ISM_TIMEOUT")
     if not raw:
         return 0.0
+    invalid_msg = (
+        f"[ptrace-ism] warning: ignoring invalid PTRACE_ISM_TIMEOUT "
+        f"{raw!r}; timeout disabled"
+    )
     try:
         timeout = float(raw)
     except ValueError:
-        print(
-            f"[ptrace-ism] warning: ignoring invalid PTRACE_ISM_TIMEOUT "
-            f"{raw!r}; timeout disabled",
-            file=sys.stderr,
-            flush=True,
-        )
+        print(invalid_msg, file=sys.stderr, flush=True)
         return 0.0
     if timeout <= 0:
         # Explicit "0" (or a negative value) means disabled; documented.
         return 0.0
     if not math.isfinite(timeout):
         # NaN / infinity are unusable as a deadline; warn and disable.
-        print(
-            f"[ptrace-ism] warning: ignoring invalid PTRACE_ISM_TIMEOUT "
-            f"{raw!r}; timeout disabled",
-            file=sys.stderr,
-            flush=True,
-        )
+        print(invalid_msg, file=sys.stderr, flush=True)
         return 0.0
     return timeout
 
@@ -296,9 +287,9 @@ class ExecEvent:
 # is replaced with a tiny stub script that silently exits with the canonical
 # deny status 126. The stub lives in /tmp (short name to fit the original
 # path buffer) with owner-only permissions and is created/verified on every
-# deny; if it is unavailable (e.g. /tmp mounted noexec), enforcement falls
-# back to the EACCES path-substitution trick -- noisy, but semantics stay
-# the same.
+# deny; when the stub file cannot be created/validated or is longer than the
+# original path buffer, enforcement falls back to the EACCES path-substitution
+# trick -- noisy, but semantics stay the same.
 DENY_STUB_PATH = "/tmp/pd"
 DENY_STUB_CONTENT = b"#!/bin/sh\nexit 126\n"
 DENY_STUB_MODE = 0o700
@@ -617,25 +608,27 @@ def enforce_deny(
     regs: UserRegs,
     event: ExecEvent,
     state: State,
-    mode: str = "EACCES",
 ) -> str:
     """Fail the denied exec syscall at syscall-entry time.
 
-    Preferred (mode == "EACCES"): overwrite the path pointer's target with
-    the deny stub path so the exec *succeeds* into a silent exit-126 stub
-    instead of failing with EACCES (which would make the parent shell print
-    a confusing error line). If the stub is unavailable or does not fit in
-    the original path buffer, fall back to "/\0" so the kernel resolves "/"
-    and returns -EACCES (noisy, but the deny semantics stay the same).
-    Fallback (mode != "EACCES"): force orig_rax to an invalid syscall number
-    so the kernel returns -ENOSYS.
+    Strategy, in order:
+    1. Stub write: overwrite the path pointer's target with the deny stub path
+       so the exec *succeeds* into a silent exit-126 stub instead of failing
+       with EACCES (which would make the parent shell print a confusing error
+       line). Used when the stub is usable and fits in the original path buffer.
+    2. EACCES path rewrite: otherwise replace the path with "/\0" so the kernel
+       resolves "/" and returns -EACCES (noisy, but the deny semantics stay the
+       same).
+    3. ENOSYS syscall-number replacement: if the EACCES memory write itself
+       fails (write_mem returns False), force orig_rax to an invalid syscall
+       number so the kernel returns -ENOSYS.
 
     Returns the mode actually used, or "failed".
     """
     # execve: path in %rdi; execveat: path in %rsi.
     path_ptr = regs.di if event.syscall == "execve" else regs.si
 
-    if mode == "EACCES" and path_ptr:
+    if path_ptr:
         # Replace the exec path with the deny stub when it fits in the original
         # path buffer and is usable, so the exec *succeeds* into a silent
         # exit-126 stub instead of failing with EACCES (which would make the
@@ -679,7 +672,6 @@ def _ensure_deny_stub(state: State) -> bool:
         with open(DENY_STUB_PATH, "rb") as stream:
             if stream.read(len(DENY_STUB_CONTENT)) != DENY_STUB_CONTENT:
                 raise OSError("stub content mismatch")
-        state.stub_ready = True
         return True
     except OSError as exc:
         trace.debug_log(f"deny stub {DENY_STUB_PATH} not usable ({exc}); recreating")
@@ -695,14 +687,12 @@ def _ensure_deny_stub(state: State) -> bool:
             os.write(fd, DENY_STUB_CONTENT)
         finally:
             os.close(fd)
-        state.stub_ready = True
         return True
     except OSError as exc:
         trace.debug_log(
             f"deny stub {DENY_STUB_PATH} recreation failed ({exc}); "
             "fallback to EACCES path substitution"
         )
-        state.stub_ready = False
         return False
 
 
@@ -723,7 +713,6 @@ class State:
         self.root_exit_code: int | None = None
         self.root_argv: tuple[str, ...] | None = None
         self.root_decision: str | None = None
-        self.stub_ready: bool = False
         self.exec_events = 0
         self.denied = 0
         # Deterministic-timeout bookkeeping (see main_loop): start_time is set
@@ -1250,9 +1239,6 @@ def launch(command: str, args: list[str], state: State) -> None:
         state.denied = 1
         state.traced.discard(pid)
         return
-
-    # (THE REST OF launch() UNCHANGED: "Block for the root's FIRST stop" waitpid
-    #  loop stays exactly as it is now.)
 
     # Block for the root's FIRST stop: the exec-trap SIGTRAP from TRACEME.
     while True:
