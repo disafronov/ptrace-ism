@@ -60,7 +60,8 @@ Schema: `{"deny": {application: [[arg, ...], ...]}}`. The application is
 matched against the basename of argv[0]. Each nested argument list is matched
 as an ordered subsequence anywhere in argv[1:], so `["push"]` blocks both
 `git push origin main` and `git -C repo push origin main`, while
-`["reset", "--hard"]` blocks `git reset --quiet --hard HEAD`.
+`["reset", "--hard"]` blocks `git reset --quiet --hard HEAD`. An empty
+argument list (`[]`) blocks every invocation of that application.
 
 There are no built-in deny rules:
 
