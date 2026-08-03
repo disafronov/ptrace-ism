@@ -9,8 +9,10 @@ default loader lookup by suffix would fail). Each case resets the module-level
 config cache and points PTRACE_ISM_CONFIG at a temp file, so cases are
 independent.
 """
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -112,7 +114,59 @@ def check(name: str, got: object, want: object) -> None:
         raise SystemExit(1)
 
 
+def check_forced_trace_uses_stderr() -> None:
+    """A denied child must not pollute the wrapped command's stdout."""
+    saved_debug = os.environ.pop("PTRACE_ISM_DEBUG", None)
+    saved_trace_file = os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            ptrace_ism.Tracer().line("denied", force=True)
+        check("forced trace stdout", stdout.getvalue(), "")
+        check("forced trace stderr", stderr.getvalue(), "denied\n")
+    finally:
+        if saved_debug is not None:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is not None:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+
+
+def check_allowed_exec_skips_trace_formatting() -> None:
+    """The silent allow path must not build an argv trace line."""
+    saved_trace = ptrace_ism.trace
+    saved_decide = ptrace_ism.decide
+    saved_exec_line = ptrace_ism._exec_line
+    saved_debug = os.environ.pop("PTRACE_ISM_DEBUG", None)
+    saved_trace_file = os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+
+    def unexpected_trace_formatting(*_args: object) -> str:
+        raise AssertionError("formatted a silent allow event")
+
+    ptrace_ism.trace = ptrace_ism.Tracer()
+    ptrace_ism.decide = lambda _: "allow"
+    ptrace_ism._exec_line = unexpected_trace_formatting
+    try:
+        state = ptrace_ism.State()
+        check(
+            "silent allow skips trace formatting",
+            ptrace_ism._apply_policy(state, 1, event(["echo", "x"])),
+            True,
+        )
+    finally:
+        ptrace_ism.trace = saved_trace
+        ptrace_ism.decide = saved_decide
+        ptrace_ism._exec_line = saved_exec_line
+        if saved_debug is not None:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is not None:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+
+
 def main() -> int:
+    check_forced_trace_uses_stderr()
+    check_allowed_exec_skips_trace_formatting()
+
     # Custom config: deny argument patterns of the named application.
     cfg = write_config(
         {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]]}}
