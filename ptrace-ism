@@ -83,6 +83,7 @@ PTRACE_O_TRACECLONE = 4
 PTRACE_O_TRACEEXEC = 16
 PTRACE_O_TRACEEXIT = 32
 PTRACE_O_TRACESYSGOOD = 64
+PTRACE_O_EXITKILL = 1 << 20
 
 # Everything we want to observe on every tracee (old and new).
 OPTIONS = (
@@ -92,6 +93,7 @@ OPTIONS = (
     | PTRACE_O_TRACEEXEC
     | PTRACE_O_TRACEEXIT
     | PTRACE_O_TRACESYSGOOD
+    | PTRACE_O_EXITKILL
 )
 
 # PTRACE_EVENT_* codes that appear in the high 16 bits of a wait status.
