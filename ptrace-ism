@@ -303,10 +303,10 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
     """Load deny rules from the config file (cached).
 
     Config: JSON file, default ~/.config/ptrace-ism.json, overridable with
-    the PTRACE_ISM_CONFIG env var. Schema: {"deny": {"git": [["push"]]}}.
-    Each key is an application basename. Each nested list is an ordered
-    subsequence which must occur in that application's argv after argv[0]. An
-    empty nested list denies the application regardless of its arguments.
+    the PTRACE_ISM_CONFIG env var. Schema: {"deny": {"rm": [], "git": [["push"]]}}.
+    Each key is an application basename. An empty list denies every invocation;
+    otherwise each nested list is an ordered subsequence which must occur after
+    argv[0].
 
     Semantics (there are no built-in fallback deny rules):
     * Missing config file (FileNotFoundError) -> no deny rules (allow all).
@@ -387,15 +387,20 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
                 f"ptrace-ism: config {config_path} is invalid: "
                 f"rules for {application!r} must be a list"
             )
+        if not patterns:
+            cleaned[application] = [[]]
+            continue
         cleaned[application] = []
         for pattern in patterns:
             if (
                 not isinstance(pattern, list)
+                or not pattern
                 or not all(isinstance(token, str) for token in pattern)
             ):
                 raise SystemExit(
                     f"ptrace-ism: config {config_path} is invalid: "
-                    f"each rule for {application!r} must be a list of strings"
+                    f"each rule for {application!r} must be a non-empty "
+                    "list of strings"
                 )
             cleaned[application].append(pattern)
 

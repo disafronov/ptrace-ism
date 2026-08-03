@@ -151,8 +151,8 @@ def main() -> int:
     finally:
         os.unlink(cfg)
 
-    # An empty pattern denies the application regardless of its arguments.
-    cfg_application = write_config({"deny": {"rm": [[]]}})
+    # An empty application rule denies it regardless of its arguments.
+    cfg_application = write_config({"deny": {"rm": []}})
     os.environ["PTRACE_ISM_CONFIG"] = cfg_application
     try:
         check("deny rm without arguments", decide_argv(["rm"]), "deny")
