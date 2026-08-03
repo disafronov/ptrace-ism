@@ -273,6 +273,11 @@ def main() -> int:
     check("timeout invalid -> disabled", parse_timeout("abc"), 0.0)
     check("timeout positive int", parse_timeout("10"), 10.0)
     check("timeout positive float", parse_timeout("2.5"), 2.5)
+    check(
+        "ptrace options kill tracees when tracer exits",
+        bool(ptrace_ism.OPTIONS & ptrace_ism.PTRACE_O_EXITKILL),
+        True,
+    )
 
     print("OK: all matcher unit tests passed")
     return 0
