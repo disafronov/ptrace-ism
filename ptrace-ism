@@ -68,7 +68,6 @@ from pathlib import Path
 # ptrace requests (from <sys/ptrace.h>).
 PTRACE_TRACEME = 0
 PTRACE_CONT = 7
-PTRACE_KILL = 8
 PTRACE_SYSCALL = 24
 PTRACE_GETREGS = 12
 PTRACE_SETREGS = 13
@@ -502,8 +501,18 @@ def cont_resume(pid: int, sig: int = 0) -> bool:
 
 
 def kill_tracee(pid: int) -> bool:
-    """Send PTRACE_KILL; used only for forced teardown on timeout."""
-    return _ptrace(PTRACE_KILL, pid, None, None) == 0
+    """Send SIGKILL directly; used only for forced teardown on timeout.
+
+    PTRACE_KILL is deprecated and may succeed without killing a tracee unless
+    it is in a signal-delivery stop. A direct SIGKILL has no such restriction.
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    return True
 
 
 def get_event_msg(pid: int) -> int:
