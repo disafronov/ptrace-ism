@@ -54,17 +54,19 @@ Environment:
 
 Default `~/.config/ptrace-ism.json`:
 
-    {"deny": [["git", "push"]]}
+    {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]]}}
 
-Schema: `{"deny": [[argv0, arg1, ...], ...]}`. Matching is prefix-based and
-argv[0] is compared by basename, so `["git", "push"]` also blocks
-`git push origin main` and `/usr/bin/git push ...`.
+Schema: `{"deny": {application: [[arg, ...], ...]}}`. The application is
+matched against the basename of argv[0]. Each nested argument list is matched
+as an ordered subsequence anywhere in argv[1:], so `["push"]` blocks both
+`git push origin main` and `git -C repo push origin main`, while
+`["reset", "--hard"]` blocks `git reset --quiet --hard HEAD`.
 
 There are no built-in deny rules:
 
 - Missing config file: no deny rules, everything is allowed.
 - A completely empty config file (0 bytes or whitespace-only), an empty `deny`
-  list (or a config whose rules are all invalid): no deny rules, everything is
+  mapping (or a config whose rules are all invalid): no deny rules, everything is
   allowed.
 - Invalid JSON, an unreadable config file, or valid JSON that is not an
   object: the tool refuses to run and exits non-zero with an error naming the

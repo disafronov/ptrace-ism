@@ -113,13 +113,15 @@ def check(name: str, got: object, want: object) -> None:
 
 
 def main() -> int:
-    # Custom config: deny git push, allow everything else.
-    cfg = write_config({"deny": [["git", "push"]]})
+    # Custom config: deny argument patterns of the named application.
+    cfg = write_config(
+        {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]]}}
+    )
     os.environ["PTRACE_ISM_CONFIG"] = cfg
     try:
         check("deny git push", decide_argv(["git", "push"]), "deny")
         check(
-            "deny git push origin main (prefix)",
+            "deny git push origin main",
             decide_argv(["git", "push", "origin", "main"]),
             "deny",
         )
@@ -128,23 +130,38 @@ def main() -> int:
             decide_argv(["/usr/bin/git", "push"]),
             "deny",
         )
+        check(
+            "deny git push after global options",
+            decide_argv(["git", "-C", "repo", "--no-pager", "push"]),
+            "deny",
+        )
+        check(
+            "deny git reset hard after options",
+            decide_argv(["git", "reset", "--quiet", "--hard", "HEAD"]),
+            "deny",
+        )
+        check(
+            "allow inverted git reset hard arguments",
+            decide_argv(["git", "--hard", "reset", "HEAD"]),
+            "allow",
+        )
         check("allow git pull", decide_argv(["git", "pull"]), "allow")
         check("allow git status", decide_argv(["git", "status"]), "allow")
         check("allow bash -c", decide_argv(["bash", "-c", "echo hi"]), "allow")
     finally:
         os.unlink(cfg)
 
-    # Empty config {"deny": []} -> no deny rules -> allow all.
-    cfg_empty = write_config({"deny": []})
+    # Empty config {"deny": {}} -> no deny rules -> allow all.
+    cfg_empty = write_config({"deny": {}})
     os.environ["PTRACE_ISM_CONFIG"] = cfg_empty
     try:
         check(
-            "allow git push (empty deny list)",
+            "allow git push (empty deny mapping)",
             decide_argv(["git", "push"]),
             "allow",
         )
         check(
-            "allow git pull (empty deny list)",
+            "allow git pull (empty deny mapping)",
             decide_argv(["git", "pull"]),
             "allow",
         )
@@ -181,7 +198,7 @@ def main() -> int:
     # Missing config (env unset, default file absent) -> no deny rules, allow all.
     # Isolate from any real ~/.config/ptrace-ism.json on the machine: the
     # default path is $HOME/.config/ptrace-ism.json, so temporarily point HOME
-    # at a fresh empty temp dir (no .config -> FileNotFoundError -> rules []).
+    # at a fresh empty temp dir (no .config -> FileNotFoundError -> rules {}).
     os.environ.pop("PTRACE_ISM_CONFIG", None)
     saved_home = os.environ.get("HOME")
     temp_home = tempfile.mkdtemp(prefix="ptrace-ism-home-")
