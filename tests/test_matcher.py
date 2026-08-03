@@ -290,6 +290,38 @@ def main() -> int:
     check("timeout invalid -> disabled", parse_timeout("abc"), 0.0)
     check("timeout positive int", parse_timeout("10"), 10.0)
     check("timeout positive float", parse_timeout("2.5"), 2.5)
+
+    timer_calls: list[tuple[object, ...]] = []
+    original_signal = ptrace_ism.signal.signal
+    original_setitimer = ptrace_ism.signal.setitimer
+    ptrace_ism.signal.signal = lambda sig, handler: timer_calls.append(
+        ("signal", sig, handler)
+    ) or "previous-handler"
+    ptrace_ism.signal.setitimer = lambda which, seconds: timer_calls.append(
+        ("setitimer", which, seconds)
+    )
+    try:
+        previous_handler = ptrace_ism._arm_timeout(0.25)
+        ptrace_ism._disarm_timeout(previous_handler)
+        check(
+            "timeout arms precise wall timer",
+            timer_calls[1],
+            ("setitimer", ptrace_ism.signal.ITIMER_REAL, 0.25),
+        )
+        check(
+            "timeout disarms wall timer",
+            timer_calls[2],
+            ("setitimer", ptrace_ism.signal.ITIMER_REAL, 0.0),
+        )
+        check(
+            "timeout restores previous handler",
+            timer_calls[3],
+            ("signal", ptrace_ism.signal.SIGALRM, "previous-handler"),
+        )
+    finally:
+        ptrace_ism.signal.signal = original_signal
+        ptrace_ism.signal.setitimer = original_setitimer
+
     check(
         "ptrace options kill tracees when tracer exits",
         bool(ptrace_ism.OPTIONS & ptrace_ism.PTRACE_O_EXITKILL),
