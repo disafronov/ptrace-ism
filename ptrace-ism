@@ -175,6 +175,19 @@ def _on_alarm(signum: int, frame) -> None:
     )
 
 
+def _arm_timeout(timeout: float):
+    """Install the timeout handler and arm a precise one-shot wall timer."""
+    previous_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    return previous_handler
+
+
+def _disarm_timeout(previous_handler) -> None:
+    """Cancel the wall timer and restore the caller's SIGALRM handler."""
+    signal.setitimer(signal.ITIMER_REAL, 0.0)
+    signal.signal(signal.SIGALRM, previous_handler)
+
+
 # --------------------------------------------------------------------------- #
 # ctypes plumbing
 # --------------------------------------------------------------------------- #
@@ -1378,13 +1391,18 @@ def main_loop(state: State, timeout: float) -> bool:
     """
     global _ALRM_TIMED_OUT
     _ALRM_TIMED_OUT = False
+    previous_alarm_handler = None
     if timeout > 0:
-        # Install a SIGALRM handler + one-shot alarm so the blocking waitpid
+        # Install a SIGALRM handler + one-shot timer so the blocking waitpid
         # below becomes interruptible when no events arrive. Without this, a
         # hang would block forever on waitpid and the timeout check would
         # never run.
-        signal.signal(signal.SIGALRM, _on_alarm)
-        signal.alarm(max(1, int(timeout)))
+        previous_alarm_handler = _arm_timeout(timeout)
+
+    def finish(result: bool) -> bool:
+        if timeout > 0:
+            _disarm_timeout(previous_alarm_handler)
+        return result
 
     state.start_time = time.monotonic()
     state.timeout = timeout
@@ -1403,7 +1421,7 @@ def main_loop(state: State, timeout: float) -> bool:
                 flush=True,
             )
             _timeout_teardown(state)
-            return False
+            return finish(False)
         # PITFALL: blocking waitpid can raise InterruptedError; retry unless
         # the SIGALRM flag is set (in which case we tear down on timeout).
         # When the timeout is disabled no alarm is armed, so _ALRM_TIMED_OUT
@@ -1418,7 +1436,7 @@ def main_loop(state: State, timeout: float) -> bool:
                     flush=True,
                 )
                 _timeout_teardown(state)
-                return False
+                return finish(False)
             # Other signal (not our alarm): retry the blocking wait.
             continue
         if wpid <= 0:
@@ -1451,10 +1469,10 @@ def main_loop(state: State, timeout: float) -> bool:
                 flush=True,
             )
             _timeout_teardown(state)
-            return False
+            return finish(False)
 
     print_summary(state)
-    return True
+    return finish(True)
 
 
 def _timeout_teardown(state: State) -> None:
