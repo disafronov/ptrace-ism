@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ptrace-ism: a raw-ptrace exec-policy prototype that replaces the GDB engine.
+ptrace-ism: a lightweight raw-ptrace guardrail for agent-driven commands.
 
 WHAT IT IS
 ----------
@@ -10,23 +10,12 @@ across the entire process tree (fork / vfork / clone, including threaded
 children). It applies a policy before the newly exec'd program enters user
 space; a matching process is killed before it runs its own code.
 
-It is written to **A/B-validate** a proposed replacement for the GDB-based
-engine. `PTRACE_EVENT_EXEC` has no seccomp dependency and avoids stopping at
-every syscall.
-
-WHY IT EXISTS (the problem it proves)
--------------------------------------
-GDB 15.1's `catch syscall execve execveat` is implemented on Linux via seccomp
-`SECCOMP_RET_TRACE`. Under a fork/exec storm (e.g. `pytest -n 16`) the kernel
-loses the PTRACE_EVENT_SECCOMP dispatch: seccomp stops race with fork/exec
-clone events, and both GDB non-stop and all-stop modes stall. Raw ptrace using
-`PTRACE_EVENT_EXEC` does not route through seccomp and therefore does not
-suffer the lost-dispatch failure. This prototype must prove that reliability
-under exactly that storm.
+It is intended to prevent an agent from accidentally running configured
+destructive commands while staying idle between process launches.
 
 STATUS
 ------
-Prototype, for A/B validation before any integration.
+Operational guardrail for accidental agent actions; not a security boundary.
 
 Scope / non-goals
 -----------------
@@ -38,8 +27,8 @@ Scope / non-goals
   deadline that kills the traced tree and exits 124. Disabled by default:
   unset / 0 / negative / invalid -> no timeout at all, the traced command
   runs as long as it needs (transparent behavior).
- * Policy: argv deny rules loaded from a JSON config file (no built-in deny
- * rules; see _get_deny_rules()), for A/B parity with ptrace-ism's `decide()`.
+* Policy: argv deny rules loaded from a JSON config file (no built-in deny
+  rules; see _get_deny_rules()).
 * Enforcement kills a denied tracee while it is stopped at PTRACE_EVENT_EXEC.
 """
 
@@ -180,7 +169,7 @@ libc.ptrace.argtypes = [
 
 
 # --------------------------------------------------------------------------- #
-# ExecEvent + policy (ported from ptrace-ism for A/B parity)
+# ExecEvent + policy
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
 class ExecEvent:
@@ -345,7 +334,7 @@ def decide(event: ExecEvent) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Trace output (mirrors ptrace-ism's _trace / exec line format for A/B)
+# Trace output
 # --------------------------------------------------------------------------- #
 class Tracer:
     """Owns trace routing: an optional append-file; otherwise stderr under
