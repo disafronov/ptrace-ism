@@ -54,14 +54,14 @@ Environment:
 
 Default `~/.config/ptrace-ism.json`:
 
-    {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]]}}
+    {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]], "rm": []}}
 
 Schema: `{"deny": {application: [[arg, ...], ...]}}`. The application is
-matched against the basename of argv[0]. Each nested argument list is matched
-as an ordered subsequence anywhere in argv[1:], so `["push"]` blocks both
-`git push origin main` and `git -C repo push origin main`, while
-`["reset", "--hard"]` blocks `git reset --quiet --hard HEAD`. An empty
-argument list (`[]`) blocks every invocation of that application.
+matched against the basename of argv[0]. An empty list such as `"rm": []`
+blocks every invocation. Each nested argument list is matched as an ordered
+subsequence anywhere in argv[1:], so `["push"]` blocks both `git push origin
+main` and `git -C repo push origin main`, while `["reset", "--hard"]` blocks
+`git reset --quiet --hard HEAD`.
 
 There are no built-in deny rules:
 
