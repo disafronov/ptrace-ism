@@ -305,7 +305,8 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
     Config: JSON file, default ~/.config/ptrace-ism.json, overridable with
     the PTRACE_ISM_CONFIG env var. Schema: {"deny": {"git": [["push"]]}}.
     Each key is an application basename. Each nested list is an ordered
-    subsequence which must occur in that application's argv after argv[0].
+    subsequence which must occur in that application's argv after argv[0]. An
+    empty nested list denies the application regardless of its arguments.
 
     Semantics (there are no built-in fallback deny rules):
     * Missing config file (FileNotFoundError) -> no deny rules (allow all).
@@ -390,13 +391,11 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
         for pattern in patterns:
             if (
                 not isinstance(pattern, list)
-                or not pattern
                 or not all(isinstance(token, str) for token in pattern)
             ):
                 raise SystemExit(
                     f"ptrace-ism: config {config_path} is invalid: "
-                    f"each rule for {application!r} must be a non-empty "
-                    "list of strings"
+                    f"each rule for {application!r} must be a list of strings"
                 )
             cleaned[application].append(pattern)
 
@@ -412,8 +411,10 @@ def _contains_in_order(args: list[str], pattern: list[str]) -> bool:
 
     Arguments may appear between the matched tokens. This avoids tying policy
     to command-line positions while retaining enough argv structure to keep
-    an inverted sequence from matching.
+    an inverted sequence from matching. An empty pattern matches every argv.
     """
+    if not pattern:
+        return True
     pattern_index = 0
     for arg in args:
         if arg == pattern[pattern_index]:
