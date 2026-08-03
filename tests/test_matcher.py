@@ -279,6 +279,15 @@ def main() -> int:
         True,
     )
 
+    killed: list[tuple[int, int]] = []
+    original_kill = ptrace_ism.os.kill
+    ptrace_ism.os.kill = lambda pid, sig: killed.append((pid, sig))
+    try:
+        check("timeout kills tracee directly", ptrace_ism.kill_tracee(42), True)
+        check("timeout sends SIGKILL", killed, [(42, ptrace_ism.signal.SIGKILL)])
+    finally:
+        ptrace_ism.os.kill = original_kill
+
     print("OK: all matcher unit tests passed")
     return 0
 
