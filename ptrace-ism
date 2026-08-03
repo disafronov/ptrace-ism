@@ -855,6 +855,37 @@ def build_exec(pid: int, nr: int, regs: UserRegs) -> ExecEvent | None:
     )
 
 
+def read_exec_event(pid: int) -> ExecEvent:
+    """Build an exec event after the kernel has stopped a successful exec.
+
+    PTRACE_EVENT_EXEC and the root TRACEME trap happen before the new program
+    executes user-space instructions. Unlike syscall-entry inspection, this
+    lets the tracer stay on PTRACE_CONT and avoid a stop at every syscall.
+    """
+    try:
+        raw_argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        raw_argv = b""
+    argv = tuple(
+        token.decode("utf-8", errors="surrogateescape")
+        for token in raw_argv.rstrip(b"\0").split(b"\0")
+        if token
+    )
+    try:
+        path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        path = argv[0] if argv else ""
+    if not argv:
+        argv = (os.path.basename(path) or "?",)
+    return ExecEvent(
+        pid=pid,
+        syscall="exec",
+        path=path,
+        argv=argv,
+        argv0=argv[0],
+    )
+
+
 def _exec_line(event: ExecEvent, decision: str) -> str:
     """Format an exec trace line to mirror ptrace-ism's engine line."""
     argv_str = " ".join(repr(arg) for arg in event.argv)
@@ -932,20 +963,12 @@ def _dispatch_stopped(state: State, pid: int, sig: int, event: int) -> None:
         )
         return
 
-    # --- exact syscall-stop match. TRACESYSGOOD reports a genuine syscall stop
-    # as SIGTRAP|0x80 (133). An EXACT match is required: other 0x80-bit values
-    # (145/147/149/150) are group-stop reports and must NOT reach the syscall
-    # handler, where their signal would be silently swallowed.
-    if sig == SYSCALL_SIGTRAP:
-        _on_syscall_stop(state, pid)
-        return
-
     # --- group-stop reports (TRACESYSGOOD marks them with the 0x80 bit, e.g.
     # SIGSTOP|0x80 = 147). Resume with sig=0: the 0x80 bit is synthetic and must
     # not be delivered as a signal, and this is not a syscall stop. Real signal
     # delivery stops (sig without 0x80) fall through to the ordinary fallback.
     if sig & 0x80:
-        syscall_resume(pid, sig=0)
+        cont_resume(pid, sig=0)
         trace.debug_log(f"group-stop pid={pid}")
         return
 
@@ -955,13 +978,13 @@ def _dispatch_stopped(state: State, pid: int, sig: int, event: int) -> None:
     # -- delivering it breaks the child and stalls the storm), and record it.
     if pid not in state.traced and event == 0:
         set_options(pid)
-        syscall_resume(pid, sig=0)
+        cont_resume(pid, sig=0)
         state.traced.add(pid)
         trace.debug_log(f"creation-stop pid={pid} traced")
         return
 
     # --- ordinary signal-delivery stop (real signal, no event): forward it.
-    syscall_resume(pid, sig=sig)
+    cont_resume(pid, sig=sig)
 
 
 def _on_event_vfork_done(state: State, pid: int) -> None:
@@ -975,8 +998,8 @@ def _on_event_vfork_done(state: State, pid: int) -> None:
     stop guarantees `pid` is stopped RIGHT NOW, so we MUST always resume it --
     an unconditional PTRACE_SYSCALL cannot race an already-resumed tracee.
     """
-    syscall_resume(pid, sig=0)
-    trace.debug_log(f"vfork-done pid={pid} resumed via syscall-resume")
+    cont_resume(pid, sig=0)
+    trace.debug_log(f"vfork-done pid={pid} resumed")
 
 
 def _on_event_exit(state: State, pid: int) -> None:
@@ -1006,7 +1029,7 @@ def _on_event_clone(state: State, pid: int, event: int) -> None:
         trace.debug_log(
             f"clone event={event} pid={pid} bad newpid; resuming"
         )
-        syscall_resume(pid)
+        cont_resume(pid)
         return
 
     if newpid not in state.traced:
@@ -1014,7 +1037,7 @@ def _on_event_clone(state: State, pid: int, event: int) -> None:
         # them on a brand-new tracee before it is resumed, else its events are
         # never reported. Ignore errors here (the child may already be gone).
         set_options(newpid)
-        if syscall_resume(newpid):
+        if cont_resume(newpid):
             # INVARIANT: only record the child once it is provably runnable.
             state.traced.add(newpid)
             trace.debug_log(
@@ -1042,13 +1065,15 @@ def _on_event_clone(state: State, pid: int, event: int) -> None:
     # exits, then deliver PTRACE_EVENT_VFORK_DONE (whose handler resumes it
     # again). So an arbitrarily late VFORK stop is harmless and needs NO hold
     # state -- this is what eliminates the parent-stuck-in-VFORK deadlock.
-    syscall_resume(pid, sig=0)
+    cont_resume(pid, sig=0)
 
 
 def _on_event_exec(state: State, pid: int) -> None:
-    """Exec event: nothing special now (no vfork hold to release); just resume."""
-    trace.debug_log(f"event-exec pid={pid}")
-    syscall_resume(pid, sig=0)
+    """Apply policy before a successfully exec'd program enters user space."""
+    event = read_exec_event(pid)
+    state.exec_events += 1
+    if _apply_policy(state, pid, event):
+        cont_resume(pid, sig=0)
 
 
 def _on_syscall_stop(state: State, pid: int) -> None:
@@ -1083,24 +1108,21 @@ def _on_syscall_entry(state: State, pid: int, info: SyscallInfo) -> None:
     syscall_resume(pid)
 
 
-def _apply_policy(state: State, pid: int, regs: UserRegs, event: ExecEvent) -> None:
-    """Run decide()/enforce_deny()/counters/logging for an already-built event.
-
-    Shared by the descendant path (_handle_exec_entry) and the root path
-    (_on_root_exec_trap). Does NOT resume the tracee.
-    """
+def _apply_policy(state: State, pid: int, event: ExecEvent) -> bool:
+    """Decide a post-exec event and return whether the tracee may continue."""
     decision = decide(event)
     trace.debug_log(
         f"exec pid={pid} syscall={event.syscall} path={event.path!r} "
         f"argv={event.argv!r} decision={decision}"
     )
     if decision == "deny":
-        mode = enforce_deny(pid, regs, event, state)
         state.denied += 1
-        trace.debug_log(f"denied pid={pid} mode={mode}")
-    # Always log the exec line (ptrace-ism logs allows too), A/B comparable;
-    # deny lines stay visible by default, allow lines are silent unless debug.
-    trace.line(_exec_line(event, decision), force=(decision == "deny"))
+        trace.line(_exec_line(event, decision), force=True)
+        kill_tracee(pid)
+        trace.debug_log(f"denied pid={pid} with SIGKILL")
+        return False
+    trace.line(_exec_line(event, decision))
+    return True
 
 
 def _handle_exec_entry(state: State, pid: int, nr: int, regs: UserRegs) -> None:
@@ -1164,159 +1186,32 @@ def _root_event_from_argv(
 
 
 def _on_root_exec_trap(state: State, pid: int) -> None:
-    """Root child's first stop: its initial execve, seen as plain SIGTRAP.
-
-    The child was started with PTRACE_TRACEME, so its very first stop is the
-    exec-trap delivered at the execve of the target command. Because
-    PTRACE_O_TRACESYSGOOD is not yet in effect, this stop is reported as plain
-    SIGTRAP (5) and never reaches _on_syscall_stop.
-
-    Unlike a descendant's syscall-entry stop, this trap fires late in execve
-    processing, when the original argv strings are no longer readable through
-    /proc/<pid>/mem. The child reported the exact argv over a pipe in
-    launch(), so we build the event from that instead of reading the tracee.
-
-    PTRACE_SETOPTIONS is applied here (as before) so fork/exec/exit events of
-    the root and its descendants keep being reported.
-    """
-    regs = get_regs(pid)
-    if regs is None:
-        trace.debug_log(f"root pid={pid} getregs failed; resuming")
-        set_options(pid)
-        syscall_resume(pid)
-        return
-
-    nr = regs.orig_rax
-    if nr in (SYS_EXECVE, SYS_EXECVEAT):
-        event = _root_event_from_argv(state, pid, nr, regs)
-        if event is not None:
-            state.exec_events += 1
-            _apply_policy(state, pid, regs, event)
-
-    # Options are per-tracee and never inherited; the root child only gets
-    # them now, at its first stop (the same point the previous code applied
-    # them), before it is resumed.
+    """Apply policy at the root's post-exec TRACEME stop."""
     set_options(pid)
-    syscall_resume(pid)
+    event = read_exec_event(pid)
+    state.exec_events += 1
+    if _apply_policy(state, pid, event):
+        cont_resume(pid)
 
 
 def launch(command: str, args: list[str], state: State) -> None:
     """fork(); child TRACEME + execvp; parent waits for the exec-trap."""
     state.start_time = time.monotonic()
-    # Pipe used by the child to report the exact argv it is about to exec and
-    # its policy decision. The root exec-trap fires late in execve processing,
-    # when the original argv strings are no longer readable through
-    # /proc/<pid>/mem, so the parent cannot read them from the tracee; the
-    # child knows them exactly.
-    rfd, wfd = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os.close(rfd)
-        # Root policy check BEFORE exec: the exec-trap fires too late to veto
-        # the exec (the kernel has already committed to it), so the only way
-        # to deny the ROOT command is to refuse to exec it here, in the child.
-        root_event = ExecEvent(
-            pid=os.getpid(),
-            syscall="execve",
-            path=command,
-            argv=(command,) + tuple(args),
-            argv0=command,
-            dirfd=None,
-            flags=None,
-        )
-        decision = decide(root_event)
-        try:
-            payload = json.dumps(
-                {"argv": [command] + args, "decision": decision}
-            ).encode("utf-8")
-        except (TypeError, UnicodeEncodeError):
-            payload = json.dumps(
-                {"argv": [], "decision": decision}
-            ).encode("utf-8")
-        try:
-            os.write(wfd, payload)
-        except OSError:
-            pass
-        os.close(wfd)
-        if decision == "deny":
-            # Refuse to exec: exit 126 ("found but not executed"). The parent
-            # prints the deny line and records the counters.
-            os._exit(126)
-        # Child: become tracee, then exec the target.
         _ptrace(PTRACE_TRACEME, 0, None, None)
-        # Do not inherit any SIGALRM timer from the tracer (when the OPT-IN
-        # timeout is active, the tracer's main loop arms a one-shot alarm
-        # before waitpid); the alarm must only interrupt the tracer's blocking
-        # waitpid, never the tracee.
-        signal.alarm(0)
-        # The exec-trap SIGTRAP from TRACEME is delivered at the exec of the
-        # *target* (os.execvp triggers it). If exec fails we exit 127, or 126
-        # when a deny surfaces as EACCES (path rewritten to "/") or ENOSYS
-        # (invalid-syscall-number fallback); both modes mean "found but not
-        # executed".
+        # Make the initial setup explicit instead of relying on an implicit
+        # exec trap. The parent installs options before this process executes
+        # the target, so root and descendants use the same PTRACE_EVENT_EXEC
+        # policy path.
+        os.kill(os.getpid(), signal.SIGSTOP)
         try:
             os.execvp(command, [command] + args)
-        except OSError as exc:
-            if exc.errno in (errno.EACCES, errno.ENOSYS):
-                os._exit(126)
+        except OSError:
             os._exit(127)
-
-    os.close(wfd)
-    raw = os.read(rfd, 65536)
-    os.close(rfd)
-    try:
-        parsed = json.loads(raw.decode("utf-8")) if raw else None
-        if isinstance(parsed, dict):
-            argv = parsed.get("argv")
-            state.root_argv = tuple(argv) if isinstance(argv, list) else None
-            state.root_decision = parsed.get("decision")
-        else:
-            state.root_argv = tuple(parsed) if isinstance(parsed, list) else None
-            state.root_decision = None
-    except (ValueError, TypeError, UnicodeDecodeError):
-        state.root_argv = None
-        state.root_decision = None
 
     state.root = pid
     state.traced.add(pid)
-
-    if state.root_decision == "deny":
-        # The child refused to exec and exited 126; there is no exec-trap.
-        # Reap it, print the deny line on the parent side (so all output stays
-        # in order), and record the counters so main() prints a normal summary.
-        deny_argv = state.root_argv or ((command,) + tuple(args))
-        deny_event = ExecEvent(
-            pid=pid,
-            syscall="execve",
-            path=command,
-            argv=deny_argv,
-            argv0=deny_argv[0],
-            dirfd=None,
-            flags=None,
-        )
-        trace.line(_exec_line(deny_event, "deny"), force=True)
-        while True:
-            try:
-                wpid, status = os.waitpid(pid, 0)
-            except InterruptedError:
-                continue
-            except ChildProcessError:
-                state.root_exit_code = 126
-                break
-            if wpid == pid:
-                if os.WIFEXITED(status):
-                    state.root_exit_code = os.WEXITSTATUS(status)
-                elif os.WIFSIGNALED(status):
-                    state.root_exit_code = 128 + os.WTERMSIG(status)
-                else:
-                    state.root_exit_code = 126
-                break
-        state.exec_events = 1
-        state.denied = 1
-        state.traced.discard(pid)
-        return
-
-    # Block for the root's FIRST stop: the exec-trap SIGTRAP from TRACEME.
     while True:
         try:
             wpid, status = os.waitpid(pid, 0)
@@ -1335,15 +1230,14 @@ def launch(command: str, args: list[str], state: State) -> None:
             state.traced.discard(pid)
             return
         if wpid == pid and os.WIFSTOPPED(status):
-            # The first stop is the exec-trap: the root child's initial
-            # execve entry, policed exactly like a descendant's exec.
-            _on_root_exec_trap(state, pid)
+            set_options(pid)
+            cont_resume(pid)
             return
-        # The child exited or died before the exec-trap (exec failure / crash).
+        # The child exited or died before its initial tracing stop.
         if wpid == pid and os.WIFEXITED(status):
             code = os.WEXITSTATUS(status)
             print(
-                f"launch: child exited with code {code} before exec-trap",
+                f"launch: child exited with code {code} before initial stop",
                 file=sys.stderr,
             )
             state.root_exit_code = code
