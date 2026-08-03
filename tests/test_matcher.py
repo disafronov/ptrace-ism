@@ -264,6 +264,14 @@ def main() -> int:
     finally:
         os.unlink(cfg_list)
 
+    # A malformed deny mapping must not silently disable the policy.
+    cfg_bad_deny = write_config({"deny": []})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_bad_deny
+    try:
+        expect_refused("non-mapping deny refuses to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_bad_deny)
+
     # PTRACE_ISM_TIMEOUT: OPT-IN run timeout. Unset/empty/0/negative/invalid
     # -> disabled (0.0); a positive number -> active with that many seconds.
     check("timeout unset -> disabled", parse_timeout(None), 0.0)

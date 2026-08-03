@@ -311,11 +311,10 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
     * Missing config file (FileNotFoundError) -> no deny rules (allow all).
     * Completely empty config file (0 bytes or whitespace-only) -> no deny
       rules (allow all); it is NOT treated as broken/invalid JSON.
-    * Empty/missing/invalid-only "deny" mapping -> no deny rules (allow all).
-    * Unreadable config (other OSError, e.g. PermissionError), invalid JSON,
-      or valid JSON that is not an object -> refuse to run: raise SystemExit
+    * Empty/missing "deny" mapping -> no deny rules (allow all).
+    * A malformed config or deny mapping -> refuse to run: raise SystemExit
       with a message naming the config path and the problem. The tool must
-      NOT silently continue.
+      NOT silently continue with a policy unexpectedly disabled.
     """
     global _deny_rules
     if _deny_rules is not None:
@@ -369,19 +368,40 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
         )
 
     raw_rules = data.get("deny", {})
-    cleaned = {
-        application: [
-            list(pattern)
-            for pattern in patterns
-            if isinstance(pattern, list) and pattern
-            and all(isinstance(token, str) for token in pattern)
-        ]
-        for application, patterns in raw_rules.items()
-        if isinstance(application, str) and application
-        and isinstance(patterns, list)
-    } if isinstance(raw_rules, dict) else {}
-    # An empty/missing/invalid-only "deny" mapping is a valid config meaning
-    # "deny nothing": allow everything.
+    if not isinstance(raw_rules, dict):
+        raise SystemExit(
+            f"ptrace-ism: config {config_path} is invalid: "
+            '"deny" must be an object'
+        )
+
+    cleaned: dict[str, list[list[str]]] = {}
+    for application, patterns in raw_rules.items():
+        if not isinstance(application, str) or not application:
+            raise SystemExit(
+                f"ptrace-ism: config {config_path} is invalid: "
+                "application names must be non-empty strings"
+            )
+        if not isinstance(patterns, list):
+            raise SystemExit(
+                f"ptrace-ism: config {config_path} is invalid: "
+                f"rules for {application!r} must be a list"
+            )
+        cleaned[application] = []
+        for pattern in patterns:
+            if (
+                not isinstance(pattern, list)
+                or not pattern
+                or not all(isinstance(token, str) for token in pattern)
+            ):
+                raise SystemExit(
+                    f"ptrace-ism: config {config_path} is invalid: "
+                    f"each rule for {application!r} must be a non-empty "
+                    "list of strings"
+                )
+            cleaned[application].append(pattern)
+
+    # An empty or missing "deny" mapping is a valid config meaning "deny
+    # nothing": allow everything.
     trace.debug_log(f"config deny rules loaded from {config_path}: {cleaned}")
     _deny_rules = cleaned
     return cleaned

@@ -66,11 +66,10 @@ There are no built-in deny rules:
 
 - Missing config file: no deny rules, everything is allowed.
 - A completely empty config file (0 bytes or whitespace-only), an empty `deny`
-  mapping (or a config whose rules are all invalid): no deny rules, everything is
-  allowed.
-- Invalid JSON, an unreadable config file, or valid JSON that is not an
-  object: the tool refuses to run and exits non-zero with an error naming the
-  config path and the problem.
+  mapping, or a config without `deny`: no deny rules, everything is allowed.
+- Invalid JSON, an unreadable config file, a non-object config, or malformed
+  `deny` rules: the tool refuses to run and exits non-zero with an error naming
+  the config path and the problem.
 
 ## Behavior notes
 
