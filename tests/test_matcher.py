@@ -163,9 +163,261 @@ def check_allowed_exec_skips_trace_formatting() -> None:
             os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
 
 
+def check_activation_modes() -> None:
+    """ptrace is active only for policy enforcement or requested observation."""
+    saved_config = os.environ.get("PTRACE_ISM_CONFIG")
+    saved_debug = os.environ.pop("PTRACE_ISM_DEBUG", None)
+    saved_trace_file = os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+    fd, config_path = tempfile.mkstemp(
+        prefix="ptrace-ism-activation-", suffix=".json", dir=str(ROOT)
+    )
+    os.close(fd)
+    missing_path = f"{config_path}.missing"
+    try:
+        os.environ["PTRACE_ISM_CONFIG"] = missing_path
+        reset_config()
+        check("missing config does not activate ptrace", ptrace_ism._should_trace(), False)
+
+        os.environ["PTRACE_ISM_CONFIG"] = config_path
+        reset_config()
+        check("empty config does not activate ptrace", ptrace_ism._should_trace(), False)
+
+        with open(config_path, "w", encoding="utf-8") as stream:
+            json.dump({"deny": {}}, stream)
+        reset_config()
+        check("empty deny mapping does not activate ptrace", ptrace_ism._should_trace(), False)
+
+        with open(config_path, "w", encoding="utf-8") as stream:
+            json.dump({"format": 1}, stream)
+        reset_config()
+        check("config without deny does not activate ptrace", ptrace_ism._should_trace(), False)
+
+        with open(config_path, "w", encoding="utf-8") as stream:
+            json.dump({"deny": {"git": [["push"]]}}, stream)
+        reset_config()
+        check("deny config activates ptrace", ptrace_ism._should_trace(), True)
+
+        os.environ["PTRACE_ISM_CONFIG"] = missing_path
+        os.environ["PTRACE_ISM_DEBUG"] = "1"
+        reset_config()
+        check("debug activates ptrace", ptrace_ism._should_trace(), True)
+
+        os.environ.pop("PTRACE_ISM_DEBUG", None)
+        os.environ["PTRACE_ISM_TRACE_FILE"] = f"{config_path}.trace"
+        reset_config()
+        check("trace file activates ptrace", ptrace_ism._should_trace(), True)
+    finally:
+        os.unlink(config_path)
+        if saved_config is None:
+            os.environ.pop("PTRACE_ISM_CONFIG", None)
+        else:
+            os.environ["PTRACE_ISM_CONFIG"] = saved_config
+        if saved_debug is not None:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is not None:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+        else:
+            os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+
+
+def check_default_mode_execs_directly() -> None:
+    """The default mode reaches execvp without creating a tracer state."""
+    saved_config = os.environ.get("PTRACE_ISM_CONFIG")
+    saved_debug = os.environ.pop("PTRACE_ISM_DEBUG", None)
+    saved_trace_file = os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+    saved_execvp = ptrace_ism.os.execvp
+    saved_launch = ptrace_ism.launch
+    calls: list[tuple[str, list[str]]] = []
+
+    def direct_exec(command: str, argv: list[str]) -> None:
+        calls.append((command, argv))
+
+    def unexpected_launch(*_args: object) -> None:
+        raise AssertionError("default mode started ptrace")
+
+    os.environ["PTRACE_ISM_CONFIG"] = str(ROOT / "no-such-ptrace-ism-config.json")
+    reset_config()
+    ptrace_ism.os.execvp = direct_exec
+    ptrace_ism.launch = unexpected_launch
+    try:
+        check("default mode direct exec exit", ptrace_ism.main(["ptrace-ism", "echo", "x"]), 127)
+        check("default mode direct exec argv", calls, [("echo", ["echo", "x"])])
+    finally:
+        ptrace_ism.os.execvp = saved_execvp
+        ptrace_ism.launch = saved_launch
+        if saved_config is None:
+            os.environ.pop("PTRACE_ISM_CONFIG", None)
+        else:
+            os.environ["PTRACE_ISM_CONFIG"] = saved_config
+        if saved_debug is not None:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is not None:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+
+
+def check_trace_file_routing() -> None:
+    """Trace-only runs write events and summary to the file, not the terminal."""
+    saved_trace = ptrace_ism.trace
+    saved_debug = os.environ.pop("PTRACE_ISM_DEBUG", None)
+    saved_trace_file = os.environ.get("PTRACE_ISM_TRACE_FILE")
+    fd, trace_path = tempfile.mkstemp(
+        prefix="ptrace-ism-trace-", suffix=".log", dir=str(ROOT)
+    )
+    os.close(fd)
+    os.environ["PTRACE_ISM_TRACE_FILE"] = trace_path
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    state = ptrace_ism.State()
+    state.root_exit_code = 0
+    try:
+        ptrace_ism.trace = ptrace_ism.Tracer()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            ptrace_ism.trace.line("allowed event")
+            ptrace_ism.trace.line("denied event", force=True)
+            ptrace_ism.print_summary(state)
+        content = Path(trace_path).read_text(encoding="utf-8")
+        check("trace file keeps allowed event", "allowed event" in content, True)
+        check("trace file keeps deny event", "denied event" in content, True)
+        check("trace file keeps summary", "[ptrace-ism] summary" in content, True)
+        check("trace file keeps terminal quiet except deny", stdout.getvalue(), "")
+        check("trace file keeps deny visible", stderr.getvalue(), "denied event\n")
+    finally:
+        ptrace_ism.trace = saved_trace
+        os.unlink(trace_path)
+        if saved_debug is not None:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is None:
+            os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+        else:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+
+
+def check_debug_and_trace_file_routing() -> None:
+    """Debug remains interactive when trace-file recording is also enabled."""
+    saved_trace = ptrace_ism.trace
+    saved_debug = os.environ.get("PTRACE_ISM_DEBUG")
+    saved_trace_file = os.environ.get("PTRACE_ISM_TRACE_FILE")
+    fd, trace_path = tempfile.mkstemp(
+        prefix="ptrace-ism-debug-trace-", suffix=".log", dir=str(ROOT)
+    )
+    os.close(fd)
+    os.environ["PTRACE_ISM_DEBUG"] = "1"
+    os.environ["PTRACE_ISM_TRACE_FILE"] = trace_path
+    stderr = io.StringIO()
+    try:
+        ptrace_ism.trace = ptrace_ism.Tracer()
+        with contextlib.redirect_stderr(stderr):
+            ptrace_ism.trace.line("debug event")
+        content = Path(trace_path).read_text(encoding="utf-8")
+        check("debug plus trace records event", "debug event" in content, True)
+        check("debug plus trace shows event", stderr.getvalue(), "debug event\n")
+    finally:
+        ptrace_ism.trace = saved_trace
+        os.unlink(trace_path)
+        if saved_debug is None:
+            os.environ.pop("PTRACE_ISM_DEBUG", None)
+        else:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is None:
+            os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+        else:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+
+
+def check_mode_matrix() -> None:
+    """Cover every policy/debug/trace-file activation combination."""
+    saved_trace = ptrace_ism.trace
+    saved_config = os.environ.get("PTRACE_ISM_CONFIG")
+    saved_debug = os.environ.get("PTRACE_ISM_DEBUG")
+    saved_trace_file = os.environ.get("PTRACE_ISM_TRACE_FILE")
+    fd, config_path = tempfile.mkstemp(
+        prefix="ptrace-ism-mode-config-", suffix=".json", dir=str(ROOT)
+    )
+    os.close(fd)
+    trace_paths: list[str] = []
+    try:
+        for policy, debug, trace_file in (
+            (False, False, False),
+            (True, False, False),
+            (False, True, False),
+            (False, False, True),
+            (True, True, False),
+            (True, False, True),
+            (False, True, True),
+            (True, True, True),
+        ):
+            name = f"policy={policy} debug={debug} trace_file={trace_file}"
+            with open(config_path, "w", encoding="utf-8") as stream:
+                json.dump({"deny": {"git": [["push"]]}} if policy else {}, stream)
+            os.environ["PTRACE_ISM_CONFIG"] = config_path
+            if debug:
+                os.environ["PTRACE_ISM_DEBUG"] = "1"
+            else:
+                os.environ.pop("PTRACE_ISM_DEBUG", None)
+
+            trace_path = f"{config_path}.{policy}-{debug}-{trace_file}.log"
+            if trace_file:
+                trace_paths.append(trace_path)
+                os.environ["PTRACE_ISM_TRACE_FILE"] = trace_path
+            else:
+                os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+
+            reset_config()
+            active = policy or debug or trace_file
+            check(f"{name} activates ptrace", ptrace_ism._should_trace(), active)
+            if not active:
+                continue
+
+            ptrace_ism.trace = ptrace_ism.Tracer()
+            state = ptrace_ism.State()
+            state.root_exit_code = 0
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                ptrace_ism.trace.line("allowed event")
+                ptrace_ism.trace.line("denied event", force=True)
+                ptrace_ism.print_summary(state)
+            terminal = stderr.getvalue()
+            check(f"{name} shows allowed events only in debug", "allowed event" in terminal, debug)
+            check(f"{name} keeps deny visible", "denied event" in terminal, True)
+            check(f"{name} shows summary without trace file or in debug", "[ptrace-ism] summary" in terminal, not trace_file or debug)
+            if trace_file:
+                content = Path(trace_path).read_text(encoding="utf-8")
+                check(f"{name} records allowed event", "allowed event" in content, True)
+                check(f"{name} records deny event", "denied event" in content, True)
+                check(f"{name} records summary", "[ptrace-ism] summary" in content, True)
+                os.unlink(trace_path)
+                trace_paths.remove(trace_path)
+    finally:
+        ptrace_ism.trace = saved_trace
+        for trace_path in trace_paths:
+            try:
+                os.unlink(trace_path)
+            except FileNotFoundError:
+                pass
+        os.unlink(config_path)
+        reset_config()
+        if saved_config is None:
+            os.environ.pop("PTRACE_ISM_CONFIG", None)
+        else:
+            os.environ["PTRACE_ISM_CONFIG"] = saved_config
+        if saved_debug is None:
+            os.environ.pop("PTRACE_ISM_DEBUG", None)
+        else:
+            os.environ["PTRACE_ISM_DEBUG"] = saved_debug
+        if saved_trace_file is None:
+            os.environ.pop("PTRACE_ISM_TRACE_FILE", None)
+        else:
+            os.environ["PTRACE_ISM_TRACE_FILE"] = saved_trace_file
+
+
 def main() -> int:
     check_forced_trace_uses_stderr()
     check_allowed_exec_skips_trace_formatting()
+    check_activation_modes()
+    check_default_mode_execs_directly()
+    check_trace_file_routing()
+    check_debug_and_trace_file_routing()
+    check_mode_matrix()
 
     # Custom config: deny argument patterns of the named application.
     cfg = write_config(

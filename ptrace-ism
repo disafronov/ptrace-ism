@@ -185,6 +185,29 @@ class ExecEvent:
 _deny_rules: dict[str, list[list[str]]] | None = None
 
 
+def _config_path() -> str:
+    """Return the configured policy path, including the default location."""
+    return os.environ.get("PTRACE_ISM_CONFIG") or str(
+        Path.home() / ".config" / "ptrace-ism.json"
+    )
+
+
+def _should_trace() -> bool:
+    """Return whether this invocation needs ptrace.
+
+    ptrace is opt-in: a non-empty policy enables enforcement, while debug and
+    trace-file modes enable observation.  A missing, empty, or allow-all
+    config is not a request to trace, so the wrapper stays transparent.
+    """
+    if os.environ.get("PTRACE_ISM_DEBUG") == "1":
+        return True
+    if os.environ.get("PTRACE_ISM_TRACE_FILE"):
+        return True
+    # Load before deciding the direct-exec path: malformed policy files must
+    # still refuse to run rather than silently disabling enforcement.
+    return bool(_get_deny_rules())
+
+
 def _get_deny_rules() -> dict[str, list[list[str]]]:
     """Load deny rules from the config file (cached).
 
@@ -206,9 +229,7 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
     global _deny_rules
     if _deny_rules is not None:
         return _deny_rules
-    config_path = os.environ.get("PTRACE_ISM_CONFIG") or str(
-        Path.home() / ".config" / "ptrace-ism.json"
-    )
+    config_path = _config_path()
     try:
         with open(config_path, "r", encoding="utf-8") as stream:
             content = stream.read()
@@ -337,16 +358,14 @@ def decide(event: ExecEvent) -> str:
 # Trace output
 # --------------------------------------------------------------------------- #
 class Tracer:
-    """Owns trace routing: an optional append-file; otherwise stderr under
-    PTRACE_ISM_DEBUG=1, stdout only for forced lines (deny), silent by
-    default."""
+    """Own trace routing to an optional file and/or interactive stderr."""
 
     def __init__(self) -> None:
         self.trace_file = os.environ.get("PTRACE_ISM_TRACE_FILE")
         self.debug = os.environ.get("PTRACE_ISM_DEBUG") == "1"
 
     def line(self, message: str, *, force: bool = False) -> None:
-        """Emit one trace line, flushed: file, stderr (debug or forced).
+        """Emit one trace line, flushed: file and stderr (debug or forced).
 
         Default routing is silent so per-exec allow lines do not pollute
         program output; deny lines pass ``force=True`` to stay visible without
@@ -361,9 +380,9 @@ class Tracer:
             except OSError as exc:
                 self.debug_log(f"trace write failed: {exc}")
                 self.trace_file = None
-        elif self.debug or force:
+        if self.debug or force:
             print(message, file=sys.stderr, flush=True)
-        # else: silent -- allowed exec lines produce no output by default
+        # else: silent -- allowed exec lines produce no output by default.
 
     def debug_log(self, message: str) -> None:
         if self.debug:
@@ -760,13 +779,15 @@ def launch(command: str, args: list[str], state: State) -> None:
 # Main loop
 # --------------------------------------------------------------------------- #
 def print_summary(state: State) -> None:
-    """Print the final run summary (exec counters, elapsed, root exit code)."""
+    """Route the final run summary according to the active observation mode."""
     elapsed = time.monotonic() - state.start_time
-    print(
+    trace.line(
         f"[ptrace-ism] summary exec_events={state.exec_events} "
         f"denied={state.denied} elapsed={elapsed:.3f}s "
         f"root_exit={state.root_exit_code}",
-        file=sys.stderr,
+        # Policy-only runs need a visible summary. Trace-file runs stay quiet
+        # unless debug was also requested (Tracer handles that case).
+        force=not bool(trace.trace_file),
     )
 
 
@@ -921,6 +942,17 @@ def main(argv: list[str]) -> int:
     if not command:
         usage()
         return 2
+
+    if not _should_trace():
+        # Default mode: no policy and no requested observation.  Do not fork,
+        # attach ptrace, load a config, or produce ptrace-ism output.
+        try:
+            os.execvp(command, [command] + args)
+        except OSError:
+            return 127
+        # os.execvp() does not return on success. Keep the fallback explicit
+        # for test doubles and unusual platform implementations.
+        return 127
 
     # OPT-IN run timeout: disabled (0.0) unless PTRACE_ISM_TIMEOUT is set to a
     # positive number; see _parse_timeout() for the exact semantics.

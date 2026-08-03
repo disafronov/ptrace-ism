@@ -32,6 +32,22 @@ Place the script on PATH and make it executable:
     ptrace-ism git push
     ptrace-ism bash -c 'git push && echo done'
 
+## Activation
+
+`ptrace-ism` uses `ptrace` only when the caller asks it to enforce policy or
+observe a process. Otherwise it replaces itself with the target via a direct
+`execvp`, with no tracing overhead and no `ptrace-ism` output.
+
+- A config with at least one deny rule enables policy enforcement: deny events
+  and a summary are written to stderr. Missing, empty, and allow-all configs
+  do not activate tracing.
+- `PTRACE_ISM_DEBUG=1` enables interactive observation: diagnostics, exec
+  events, and a summary are written to stderr, even without a config.
+- `PTRACE_ISM_TRACE_FILE=<path>` enables audit recording: events and the
+  summary are appended to the file, even without a config. Deny events remain
+  visible on stderr; the terminal is otherwise quiet.
+- When both debug and trace file are set, events go to both destinations.
+
 Environment:
 
 - `PTRACE_ISM_CONFIG` — path to rules JSON (default `~/.config/ptrace-ism.json`)
@@ -73,8 +89,9 @@ There are no built-in deny rules:
   The corresponding process status is normally 137.
 - Nested tracing is impossible by kernel semantics: an already-traced child
   cannot PTRACE_TRACEME again (outer tracer keeps claiming descendants).
-- Every normal run emits one `[ptrace-ism] summary` line to stderr
-  (`exec_events`, `denied`, `elapsed`, `root_exit`).
+- A traced run emits one `[ptrace-ism] summary` line (`exec_events`, `denied`,
+  `elapsed`, `root_exit`) to stderr, except trace-file-only mode, where it is
+  written to the trace file.
 
 Exit codes:
 
@@ -92,10 +109,10 @@ Makefile for what each runs).
 
 `make storm` runs the 40 storm tests in `tests/test_storm_*.py` with pytest-xdist
 (`pytest -n 16`). Each file executes the `ptrace-ism` wrapper around a command
-(`/usr/bin/uname -p`, `/bin/echo x`) and asserts the tool's `[ptrace-ism] summary`
-stderr line, so the storm fires 80 real ptrace-ism invocations. It must run on a
-real host: the storm tests use ptrace through the tool, which may be restricted
-in containers and sandboxes.
+(`/usr/bin/uname -p`, `/bin/echo x`) with debug enabled and asserts the tool's
+`[ptrace-ism] summary` stderr line, so the storm fires 80 real ptrace-ism
+invocations. It must run on a real host: the storm tests use ptrace through the
+tool, which may be restricted in containers and sandboxes.
 
 `make storm` needs pytest and pytest-xdist:
 `python3 -m pip install pytest pytest-xdist`
