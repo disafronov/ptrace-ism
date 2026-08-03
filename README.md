@@ -6,16 +6,12 @@ across the entire process tree (fork / vfork / clone), then applies an
 argv-based deny policy before the new program enters user space. A denied
 tracee is killed before it runs its own code.
 
-Python 3 stdlib only. A from-scratch replacement for an earlier GDB-based
-engine (which lost seccomp dispatch under fork/exec storms).
-
-> **Disclaimer: PROTOTYPE, not a security boundary.** ptrace-ism is a
-> demonstration/PROTOTYPE for A/B validation, not a hardened security sandbox.
-> Its deny decision is based on argv read from `/proc/pid/cmdline` after a
-> successful exec event. The matching (basename argv[0] plus ordered arguments) can be
-> trivially bypassed, for example with global git options such as `git -C` or
-> execvp argv[0] tricks. Enforcement is not kernel-level isolation. Do not
-> rely on it as a security boundary in production.
+> **Not a security boundary.** ptrace-ism is a guardrail against accidental
+> agent actions, not a hardened sandbox for hostile code. It evaluates argv
+> from `/proc/pid/cmdline` after a successful exec event. A process that wants
+> to evade the policy can choose a different executable, change argv, or use
+> another unblocked path. Enforcement is not kernel-level isolation; do not
+> rely on it to contain malicious code.
 
 ## Requirements
 
