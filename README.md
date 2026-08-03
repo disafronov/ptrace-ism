@@ -38,9 +38,9 @@ Place the script on PATH and make it executable:
 observe a process. Otherwise it replaces itself with the target via a direct
 `execvp`, with no tracing overhead and no `ptrace-ism` output.
 
-- A config with at least one deny rule enables policy enforcement: deny events
-  and a summary are written to stderr. Missing, empty, and allow-all configs
-  do not activate tracing.
+- A config with at least one deny rule enables enforcement: deny events and a
+  summary are written to stderr. Missing, empty, and allow-only configs do not
+  activate tracing.
 - `PTRACE_ISM_DEBUG=1` enables interactive observation: diagnostics, exec
   events, and a summary are written to stderr, even without a config.
 - `PTRACE_ISM_TRACE_FILE=<path>` enables audit recording: events and the
@@ -64,22 +64,40 @@ Environment:
 
 Default `~/.config/ptrace-ism.json`:
 
-    {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]], "rm": []}}
+    {
+      "git": [
+        [],
+        [["status"], "allow"],
+        [["push"]],
+        [["push", "--dry-run"], "allow"]
+      ],
+      "rm": []
+    }
 
-Schema: `{"deny": {application: [[arg, ...], ...]}}`. The application is
-matched against the basename of argv[0]. An empty list such as `"rm": []`
-blocks every invocation. Each nested argument list is matched as an ordered
-subsequence anywhere in argv[1:], so `["push"]` blocks both `git push origin
-main` and `git -C repo push origin main`, while `["reset", "--hard"]` blocks
-`git reset --quiet --hard HEAD`.
+The top-level object maps an application basename to its policy. The application
+is matched against the basename of `argv[0]`; `argv` is never converted into a
+command string. A missing application has no policy and is allowed.
+
+- `"rm": []` denies every `rm` invocation.
+- Within a non-empty rule list, `[]` is a universal deny.
+- `[pattern]` denies; `[pattern, "allow"]` or `[pattern, "deny"]` uses the
+  stated action. Patterns are non-empty arrays of strings.
+- All matching patterns are compared by length; the longest wins. Equal-length
+  matches with different actions are a configuration error.
+- `[[]]` is invalid: `application: []` is the sole spelling for a policy that
+  denies every invocation.
+
+Patterns match as ordered subsequences anywhere in `argv[1:]`, so `["push"]`
+matches both `git push origin main` and `git -C repo push origin main`.
+`["reset", "--hard"]` matches `git reset --quiet --hard HEAD`.
 
 There are no built-in deny rules:
 
 - Missing config file: no deny rules, everything is allowed.
-- A completely empty config file (0 bytes or whitespace-only), an empty `deny`
-  mapping, or a config without `deny`: no deny rules, everything is allowed.
+- A completely empty config file (0 bytes or whitespace-only) or `{}`: no
+  policy, everything is allowed.
 - Invalid JSON, an unreadable config file, a non-object config, or malformed
-  `deny` rules: the tool refuses to run and exits non-zero with an error naming
+  policy rules: the tool refuses to run and exits non-zero with an error naming
   the config path and the problem.
 
 ## Behavior notes

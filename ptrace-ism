@@ -182,7 +182,15 @@ class ExecEvent:
     flags: int | None = None
 
 
-_deny_rules: dict[str, list[list[str]]] | None = None
+@dataclass(frozen=True, slots=True)
+class Rule:
+    """One declarative argv rule for an application."""
+
+    pattern: tuple[str, ...]
+    action: str
+
+
+_deny_rules: dict[str, list[Rule]] | None = None
 
 
 def _config_path() -> str:
@@ -205,26 +213,22 @@ def _should_trace() -> bool:
         return True
     # Load before deciding the direct-exec path: malformed policy files must
     # still refuse to run rather than silently disabling enforcement.
-    return bool(_get_deny_rules())
+    return any(
+        rule.action == "deny"
+        for rules in _get_deny_rules().values()
+        for rule in rules
+    )
 
 
-def _get_deny_rules() -> dict[str, list[list[str]]]:
-    """Load deny rules from the config file (cached).
+def _get_deny_rules() -> dict[str, list[Rule]]:
+    """Load and validate the declarative policy config (cached).
 
-    Config: JSON file, default ~/.config/ptrace-ism.json, overridable with
-    the PTRACE_ISM_CONFIG env var. Schema: {"deny": {"rm": [], "git": [["push"]]}}.
-    Each key is an application basename. An empty list denies every invocation;
-    otherwise each nested list is an ordered subsequence which must occur after
-    argv[0].
-
-    Semantics (there are no built-in fallback deny rules):
-    * Missing config file (FileNotFoundError) -> no deny rules (allow all).
-    * Completely empty config file (0 bytes or whitespace-only) -> no deny
-      rules (allow all); it is NOT treated as broken/invalid JSON.
-    * Empty/missing "deny" mapping -> no deny rules (allow all).
-    * A malformed config or deny mapping -> refuse to run: raise SystemExit
-      with a message naming the config path and the problem. The tool must
-      NOT silently continue with a policy unexpectedly disabled.
+    The top-level object maps an application basename to its rule list. An
+    application with ``[]`` denies every invocation. Otherwise, each entry is
+    either ``[]`` (a universal deny), ``[pattern]`` (a deny), or
+    ``[pattern, action]``. Patterns are non-empty arrays of strings and action
+    is ``allow`` or ``deny``. The lone spelling ``[[]]`` is rejected because it
+    duplicates the canonical application-level ``[]`` form.
     """
     global _deny_rules
     if _deny_rules is not None:
@@ -275,30 +279,38 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
             f"expected a JSON object, got {type(data).__name__}"
         )
 
-    raw_rules = data.get("deny", {})
-    if not isinstance(raw_rules, dict):
-        raise SystemExit(
-            f"ptrace-ism: config {config_path} is invalid: "
-            '"deny" must be an object'
-        )
-
-    cleaned: dict[str, list[list[str]]] = {}
-    for application, patterns in raw_rules.items():
+    cleaned: dict[str, list[Rule]] = {}
+    for application, entries in data.items():
         if not isinstance(application, str) or not application:
             raise SystemExit(
                 f"ptrace-ism: config {config_path} is invalid: "
                 "application names must be non-empty strings"
             )
-        if not isinstance(patterns, list):
+        if not isinstance(entries, list):
             raise SystemExit(
                 f"ptrace-ism: config {config_path} is invalid: "
                 f"rules for {application!r} must be a list"
             )
-        if not patterns:
-            cleaned[application] = [[]]
+        if not entries:
+            cleaned[application] = [Rule((), "deny")]
             continue
         cleaned[application] = []
-        for pattern in patterns:
+        for entry in entries:
+            if entry == []:
+                if len(entries) == 1:
+                    raise SystemExit(
+                        f"ptrace-ism: config {config_path} is invalid: "
+                        f"use {application!r}: [] for a universal deny"
+                    )
+                cleaned[application].append(Rule((), "deny"))
+                continue
+            if not isinstance(entry, list) or len(entry) not in (1, 2):
+                raise SystemExit(
+                    f"ptrace-ism: config {config_path} is invalid: "
+                    f"each rule for {application!r} must be [], [pattern], "
+                    "or [pattern, action]"
+                )
+            pattern = entry[0]
             if (
                 not isinstance(pattern, list)
                 or not pattern
@@ -306,19 +318,23 @@ def _get_deny_rules() -> dict[str, list[list[str]]]:
             ):
                 raise SystemExit(
                     f"ptrace-ism: config {config_path} is invalid: "
-                    f"each rule for {application!r} must be a non-empty "
-                    "list of strings"
+                    f"patterns for {application!r} must be non-empty arrays "
+                    "of strings"
                 )
-            cleaned[application].append(pattern)
+            action = "deny" if len(entry) == 1 else entry[1]
+            if action not in ("allow", "deny"):
+                raise SystemExit(
+                    f"ptrace-ism: config {config_path} is invalid: "
+                    f"actions for {application!r} must be 'allow' or 'deny'"
+                )
+            cleaned[application].append(Rule(tuple(pattern), action))
 
-    # An empty or missing "deny" mapping is a valid config meaning "deny
-    # nothing": allow everything.
-    trace.debug_log(f"config deny rules loaded from {config_path}: {cleaned}")
+    trace.debug_log(f"config rules loaded from {config_path}: {cleaned}")
     _deny_rules = cleaned
     return cleaned
 
 
-def _contains_in_order(args: list[str], pattern: list[str]) -> bool:
+def _contains_in_order(args: list[str], pattern: tuple[str, ...]) -> bool:
     """Return whether ``pattern`` occurs in ``args`` in the same order.
 
     Arguments may appear between the matched tokens. This avoids tying policy
@@ -337,21 +353,28 @@ def _contains_in_order(args: list[str], pattern: list[str]) -> bool:
 
 
 def decide(event: ExecEvent) -> str:
-    """Policy entry point: deny if argv matches an application rule.
-
-    argv[0] is matched by basename. A configured pattern must occur, in
-    order, anywhere in argv[1:], so ["push"] denies both `git push` and
-    `git -C repo push origin main` without parsing Git's global options.
-    """
+    """Return the most-specific matching action for one argv event."""
     rules = _get_deny_rules()
     argv = list(event.argv)
     if not argv:
         return "allow"
     application = Path(argv[0]).name
-    for pattern in rules.get(application, []):
-        if _contains_in_order(argv[1:], pattern):
-            return "deny"
-    return "allow"
+    matches = [
+        rule
+        for rule in rules.get(application, [])
+        if _contains_in_order(argv[1:], rule.pattern)
+    ]
+    if not matches:
+        return "allow"
+    specificity = max(len(rule.pattern) for rule in matches)
+    actions = {rule.action for rule in matches if len(rule.pattern) == specificity}
+    if len(actions) != 1:
+        raise SystemExit(
+            f"ptrace-ism: config {_config_path()} is invalid: "
+            f"ambiguous matching rules for {application!r} at specificity "
+            f"{specificity}"
+        )
+    return actions.pop()
 
 
 # --------------------------------------------------------------------------- #
