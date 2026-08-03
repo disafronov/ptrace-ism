@@ -357,10 +357,11 @@ class Tracer:
         self.debug = os.environ.get("PTRACE_ISM_DEBUG") == "1"
 
     def line(self, message: str, *, force: bool = False) -> None:
-        """Emit one trace line, flushed: file, stderr (debug), or stdout (force).
+        """Emit one trace line, flushed: file, stderr (debug or forced).
 
         Default routing is silent so per-exec allow lines do not pollute
-        program output; deny lines pass ``force=True`` to stay visible.
+        program output; deny lines pass ``force=True`` to stay visible without
+        contaminating the wrapped command's stdout.
         """
         if self.trace_file:
             try:
@@ -371,10 +372,8 @@ class Tracer:
             except OSError as exc:
                 self.debug_log(f"trace write failed: {exc}")
                 self.trace_file = None
-        elif self.debug:
+        elif self.debug or force:
             print(message, file=sys.stderr, flush=True)
-        elif force:
-            print(message, flush=True)
         # else: silent -- allowed exec lines produce no output by default
 
     def debug_log(self, message: str) -> None:
@@ -692,7 +691,11 @@ def _apply_policy(state: State, pid: int, event: ExecEvent) -> bool:
         kill_tracee(pid)
         trace.debug_log(f"denied pid={pid} with SIGKILL")
         return False
-    trace.line(_exec_line(event, decision))
+    # Formatting argv can be expensive for command runners that execute many
+    # short-lived tools. The normal allow path is silent, so avoid repr/join
+    # work unless somebody is actually consuming the trace.
+    if trace.trace_file or trace.debug:
+        trace.line(_exec_line(event, decision))
     return True
 
 
