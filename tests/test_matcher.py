@@ -183,19 +183,14 @@ def check_activation_modes() -> None:
         check("empty config does not activate ptrace", ptrace_ism._should_trace(), False)
 
         with open(config_path, "w", encoding="utf-8") as stream:
-            json.dump({"deny": {}}, stream)
-        reset_config()
-        check("empty deny mapping does not activate ptrace", ptrace_ism._should_trace(), False)
-
-        with open(config_path, "w", encoding="utf-8") as stream:
-            json.dump({"format": 1}, stream)
-        reset_config()
-        check("config without deny does not activate ptrace", ptrace_ism._should_trace(), False)
-
-        with open(config_path, "w", encoding="utf-8") as stream:
-            json.dump({"deny": {"git": [["push"]]}}, stream)
+            json.dump({"git": [[["push"]]]}, stream)
         reset_config()
         check("deny config activates ptrace", ptrace_ism._should_trace(), True)
+
+        with open(config_path, "w", encoding="utf-8") as stream:
+            json.dump({"git": [[["status"], "allow"]]}, stream)
+        reset_config()
+        check("allow-only config does not activate ptrace", ptrace_ism._should_trace(), False)
 
         os.environ["PTRACE_ISM_CONFIG"] = missing_path
         os.environ["PTRACE_ISM_DEBUG"] = "1"
@@ -348,7 +343,7 @@ def check_mode_matrix() -> None:
         ):
             name = f"policy={policy} debug={debug} trace_file={trace_file}"
             with open(config_path, "w", encoding="utf-8") as stream:
-                json.dump({"deny": {"git": [["push"]]}} if policy else {}, stream)
+                json.dump({"git": [[["push"]]]} if policy else {}, stream)
             os.environ["PTRACE_ISM_CONFIG"] = config_path
             if debug:
                 os.environ["PTRACE_ISM_DEBUG"] = "1"
@@ -421,7 +416,7 @@ def main() -> int:
 
     # Custom config: deny argument patterns of the named application.
     cfg = write_config(
-        {"deny": {"git": [["push"], ["reset", "--hard"], ["clean"]]}}
+        {"git": [[["push"]], [["reset", "--hard"]], [["clean"]]]}
     )
     os.environ["PTRACE_ISM_CONFIG"] = cfg
     try:
@@ -458,7 +453,7 @@ def main() -> int:
         os.unlink(cfg)
 
     # An empty application rule denies it regardless of its arguments.
-    cfg_application = write_config({"deny": {"rm": []}})
+    cfg_application = write_config({"rm": []})
     os.environ["PTRACE_ISM_CONFIG"] = cfg_application
     try:
         check("deny rm without arguments", decide_argv(["rm"]), "deny")
@@ -466,17 +461,81 @@ def main() -> int:
     finally:
         os.unlink(cfg_application)
 
-    # Empty config {"deny": {}} -> no deny rules -> allow all.
-    cfg_empty = write_config({"deny": {}})
+    # A universal deny may have more-specific allow exceptions. The longest
+    # matching pattern wins; rule order does not participate in the decision.
+    cfg_exceptions = write_config(
+        {
+            "git": [
+                [],
+                [["status"], "allow"],
+                [["push"]],
+                [["push", "--dry-run"], "allow"],
+            ]
+        }
+    )
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_exceptions
+    try:
+        check("universal deny blocks git pull", decide_argv(["git", "pull"]), "deny")
+        check("specific allow permits git status", decide_argv(["git", "status"]), "allow")
+        check("default action denies git push", decide_argv(["git", "push"]), "deny")
+        check(
+            "longer allow overrides push deny",
+            decide_argv(["git", "push", "--dry-run"]),
+            "allow",
+        )
+    finally:
+        os.unlink(cfg_exceptions)
+
+    # Equal-length matching patterns with different actions are ambiguous.
+    cfg_ambiguous = write_config(
+        {"git": [[["push"], "allow"], [["push"], "deny"]]}
+    )
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_ambiguous
+    try:
+        expect_refused("ambiguous matching actions refuse to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_ambiguous)
+
+    # The universal deny has exactly one canonical spelling: application: [].
+    cfg_duplicate_universal = write_config({"git": [[]]})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_duplicate_universal
+    try:
+        expect_refused("duplicate universal syntax refuses to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_duplicate_universal)
+
+    cfg_non_array_pattern = write_config({"git": [["push"]]})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_non_array_pattern
+    try:
+        expect_refused("non-array pattern refuses to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_non_array_pattern)
+
+    cfg_empty_allow_pattern = write_config({"git": [[[], "allow"]]})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_empty_allow_pattern
+    try:
+        expect_refused("empty allow pattern refuses to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_empty_allow_pattern)
+
+    cfg_bad_action = write_config({"git": [[["push"], "permit"]]})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_bad_action
+    try:
+        expect_refused("unknown action refuses to run", ["git", "push"])
+    finally:
+        os.unlink(cfg_bad_action)
+
+    # Empty config -> no rules -> allow all.
+    cfg_empty = write_config({})
     os.environ["PTRACE_ISM_CONFIG"] = cfg_empty
     try:
         check(
-            "allow git push (empty deny mapping)",
+            "allow git push (empty config)",
             decide_argv(["git", "push"]),
             "allow",
         )
         check(
-            "allow git pull (empty deny mapping)",
+            "allow git pull (empty config)",
             decide_argv(["git", "pull"]),
             "allow",
         )
@@ -579,13 +638,13 @@ def main() -> int:
     finally:
         os.unlink(cfg_list)
 
-    # A malformed deny mapping must not silently disable the policy.
-    cfg_bad_deny = write_config({"deny": []})
-    os.environ["PTRACE_ISM_CONFIG"] = cfg_bad_deny
+    # A malformed application rule list must not silently disable the policy.
+    cfg_bad_rules = write_config({"git": "push"})
+    os.environ["PTRACE_ISM_CONFIG"] = cfg_bad_rules
     try:
-        expect_refused("non-mapping deny refuses to run", ["git", "push"])
+        expect_refused("non-list rules refuse to run", ["git", "push"])
     finally:
-        os.unlink(cfg_bad_deny)
+        os.unlink(cfg_bad_rules)
 
     # PTRACE_ISM_TIMEOUT: OPT-IN run timeout. Unset/empty/0/negative/invalid
     # -> disabled (0.0); a positive number -> active with that many seconds.
