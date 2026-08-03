@@ -1,23 +1,21 @@
 # ptrace-ism
 
 A standalone raw-ptrace process tracer for Linux x86_64. It execs a target
-command as its own child and ptraces it, observing every execve(2)/execveat(2)
-syscall entry across the entire process tree (fork / vfork / clone), applies an
-argv-based deny policy, and denies matching execs: the root command is refused
-before exec (exit 126), descendant execs are blocked at the syscall entry.
+command as its own child and ptraces it, observing successful exec events
+across the entire process tree (fork / vfork / clone), then applies an
+argv-based deny policy before the new program enters user space. A denied
+tracee is killed before it runs its own code.
 
 Python 3 stdlib only. A from-scratch replacement for an earlier GDB-based
 engine (which lost seccomp dispatch under fork/exec storms).
 
 > **Disclaimer: PROTOTYPE, not a security boundary.** ptrace-ism is a
 > demonstration/PROTOTYPE for A/B validation, not a hardened security sandbox.
-> Its deny decision is based on argv read from the tracee's memory via
-> `/proc/pid/mem`, which is a classic time-of-check/time-of-use (TOCTOU) race
-> between check and exec. The matching (basename argv[0] plus a prefix) can be
+> Its deny decision is based on argv read from `/proc/pid/cmdline` after a
+> successful exec event. The matching (basename argv[0] plus ordered arguments) can be
 > trivially bypassed, for example with global git options such as `git -C` or
-> execvp argv[0] tricks. Enforcement rewrites the exec path or the syscall
-> number and is not kernel-level isolation. Do not rely on it as a security
-> boundary in production.
+> execvp argv[0] tricks. Enforcement is not kernel-level isolation. Do not
+> rely on it as a security boundary in production.
 
 ## Requirements
 
@@ -74,10 +72,9 @@ There are no built-in deny rules:
 
 ## Behavior notes
 
-- Denied root command: the child exits 126 before exec; `&&` / `set -e`
-  chains break, `;` continues.
-- Denied descendant exec: the exec path is replaced with a tiny stub that
-  silently exits 126 (fallbacks: EACCES path rewrite, ENOSYS syscall number).
+- A denied exec has completed in the kernel, but is stopped before the new
+  program can execute user-space instructions; ptrace-ism sends it `SIGKILL`.
+  The corresponding process status is normally 137.
 - Nested tracing is impossible by kernel semantics: an already-traced child
   cannot PTRACE_TRACEME again (outer tracer keeps claiming descendants).
 - Every normal run emits one `[ptrace-ism] summary` line to stderr
@@ -87,8 +84,7 @@ Exit codes:
 
 - `2` — usage error (no command given)
 - `124` — run timeout (when `PTRACE_ISM_TIMEOUT` is set and exceeded)
-- `126` — root command denied (found but not executed)
-- `127` — command not found / exec fails (other than EACCES/ENOSYS)
+- `127` — command not found / exec fails
 
 ## Development
 

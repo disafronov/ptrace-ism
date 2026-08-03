@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-ptrace-ism: a raw-ptrace mini-strace prototype that replaces the GDB engine.
+ptrace-ism: a raw-ptrace exec-policy prototype that replaces the GDB engine.
 
 WHAT IT IS
 ----------
-A standalone, from-scratch Linux x86_64 tracer (a "mini strace") driven
-directly by the ptrace(2) syscall. It execs a target `command` as its own child
-and ptraces it, observing *every* execve()/execveat() syscall entry across the
-entire process tree (fork / vfork / clone, including threaded children), applies
-a policy decision to each exec, and denies matching execs: the root command is
-refused before exec (the child exits 126), descendant execs are blocked at the
-syscall entry (silent exit-126 stub, with EACCES/ENOSYS fallbacks).
+A standalone Linux x86_64 tracer driven directly by the ptrace(2) syscall. It
+execs a target `command` as its own child and observes successful exec events
+across the entire process tree (fork / vfork / clone, including threaded
+children). It applies a policy before the newly exec'd program enters user
+space; a matching process is killed before it runs its own code.
 
 It is written to **A/B-validate** a proposed replacement for the GDB-based
-engine.
+engine. `PTRACE_EVENT_EXEC` has no seccomp dependency and avoids stopping at
+every syscall.
 
 WHY IT EXISTS (the problem it proves)
 -------------------------------------
@@ -21,9 +20,9 @@ GDB 15.1's `catch syscall execve execveat` is implemented on Linux via seccomp
 `SECCOMP_RET_TRACE`. Under a fork/exec storm (e.g. `pytest -n 16`) the kernel
 loses the PTRACE_EVENT_SECCOMP dispatch: seccomp stops race with fork/exec
 clone events, and both GDB non-stop and all-stop modes stall. Raw ptrace using
-PTRACE_SYSCALL (the same mechanism strace uses) does not route through seccomp
-and therefore does not suffer the lost-dispatch failure. This prototype must
-prove that reliability under exactly that storm.
+`PTRACE_EVENT_EXEC` does not route through seccomp and therefore does not
+suffer the lost-dispatch failure. This prototype must prove that reliability
+under exactly that storm.
 
 STATUS
 ------
@@ -32,31 +31,25 @@ Prototype, for A/B validation before any integration.
 Scope / non-goals
 -----------------
 * Linux x86_64 only.
-* Python 3 stdlib only (ctypes, errno, json, math, os, signal, stat, sys,
+* Python 3 stdlib only (ctypes, json, math, os, signal, sys,
   time, dataclasses, pathlib).
-* Observes execve(2) + execveat(2) at syscall ENTRY using
-  PTRACE_GET_SYSCALL_INFO.
+* Observes successful execs using PTRACE_EVENT_EXEC.
 * OPT-IN run timeout: `PTRACE_ISM_TIMEOUT=<seconds>` arms a SIGALRM-based
   deadline that kills the traced tree and exits 124. Disabled by default:
   unset / 0 / negative / invalid -> no timeout at all, the traced command
   runs as long as it needs (transparent behavior).
  * Policy: argv deny rules loaded from a JSON config file (no built-in deny
  * rules; see _get_deny_rules()), for A/B parity with ptrace-ism's `decide()`.
-* Enforcement at syscall entry: substitute the exec path with a tiny deny stub
-  that silently exits 126 (no parent-shell error line); fallback to rewriting
-  the path to "/" (kernel -> EACCES) and, last, forcing an invalid syscall
-  number (kernel -> ENOSYS).
+* Enforcement kills a denied tracee while it is stopped at PTRACE_EVENT_EXEC.
 """
 
 from __future__ import annotations
 
 import ctypes
-import errno
 import json
 import math
 import os
 import signal
-import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -68,12 +61,8 @@ from pathlib import Path
 # ptrace requests (from <sys/ptrace.h>).
 PTRACE_TRACEME = 0
 PTRACE_CONT = 7
-PTRACE_SYSCALL = 24
-PTRACE_GETREGS = 12
-PTRACE_SETREGS = 13
 PTRACE_SETOPTIONS = 0x4200
 PTRACE_GETEVENTMSG = 0x4201
-PTRACE_GET_SYSCALL_INFO = 0x420E
 
 # ptrace options.
 PTRACE_O_TRACEFORK = 1
@@ -81,7 +70,6 @@ PTRACE_O_TRACEVFORK = 2
 PTRACE_O_TRACECLONE = 4
 PTRACE_O_TRACEEXEC = 16
 PTRACE_O_TRACEEXIT = 32
-PTRACE_O_TRACESYSGOOD = 64
 PTRACE_O_EXITKILL = 1 << 20
 
 # Everything we want to observe on every tracee (old and new).
@@ -91,7 +79,6 @@ OPTIONS = (
     | PTRACE_O_TRACECLONE
     | PTRACE_O_TRACEEXEC
     | PTRACE_O_TRACEEXIT
-    | PTRACE_O_TRACESYSGOOD
     | PTRACE_O_EXITKILL
 )
 
@@ -103,17 +90,6 @@ PTRACE_EVENT_EXEC = 4
 PTRACE_EVENT_VFORK_DONE = 5
 PTRACE_EVENT_EXIT = 6
 
-# Syscall numbers of interest (x86_64).
-SYS_EXECVE = 59
-SYS_EXECVEAT = 322
-INVALID_SYSCALL_NR = 9999
-
-# PTRACE_GET_SYSCALL_INFO `op` values.
-PTRACE_SYSCALL_INFO_ENTRY = 1
-
-# Signal that reports a suppressed syscall-stop when TRACESYSGOOD is set.
-# The high bit (0x80) flags "this is a syscall stop, not a real SIGTRAP".
-SYSCALL_SIGTRAP = signal.SIGTRAP | 0x80  # 0x85
 
 # --------------------------------------------------------------------------- #
 # Timeout (OPT-IN, SIGALRM)
@@ -203,86 +179,6 @@ libc.ptrace.argtypes = [
 ]
 
 
-class UserRegs(ctypes.Structure):
-    """x86-64 user register set, exact kernel `struct user_regs_struct` order.
-
-    Every field is a c_ulong (8 bytes). The order matters for PTRACE_GETREGS /
-    PTRACE_SETREGS so each register lands in the correct slot.
-    """
-
-    _fields_ = [
-        ("r15", ctypes.c_ulong),
-        ("r14", ctypes.c_ulong),
-        ("r13", ctypes.c_ulong),
-        ("r12", ctypes.c_ulong),
-        ("bp", ctypes.c_ulong),
-        ("bx", ctypes.c_ulong),
-        ("r11", ctypes.c_ulong),
-        ("r10", ctypes.c_ulong),
-        ("r9", ctypes.c_ulong),
-        ("r8", ctypes.c_ulong),
-        ("rax", ctypes.c_ulong),
-        ("rcx", ctypes.c_ulong),
-        ("dx", ctypes.c_ulong),
-        ("si", ctypes.c_ulong),
-        ("di", ctypes.c_ulong),
-        ("orig_rax", ctypes.c_ulong),
-        ("rip", ctypes.c_ulong),
-        ("cs", ctypes.c_ulong),
-        ("eflags", ctypes.c_ulong),
-        ("sp", ctypes.c_ulong),
-        ("ss", ctypes.c_ulong),
-        ("fs_base", ctypes.c_ulong),
-        ("gs_base", ctypes.c_ulong),
-        ("ds", ctypes.c_ulong),
-        ("es", ctypes.c_ulong),
-        ("fs", ctypes.c_ulong),
-        ("gs", ctypes.c_ulong),
-    ]
-
-
-class _SyscallEntry(ctypes.Structure):
-    _fields_ = [
-        ("nr", ctypes.c_uint64),
-        ("args", ctypes.c_uint64 * 6),
-    ]
-
-
-class _SyscallExit(ctypes.Structure):
-    _fields_ = [
-        ("rval", ctypes.c_int64),
-        ("is_error", ctypes.c_uint8),
-    ]
-
-
-class _SyscallUnion(ctypes.Union):
-    """Union of per-`op` payloads (entry vs exit); they overlap in memory."""
-
-    _fields_ = [
-        ("entry", _SyscallEntry),
-        ("exit", _SyscallExit),
-    ]
-
-
-class SyscallInfo(ctypes.Structure):
-    """Kernel `struct ptrace_syscall_info` (x86-64, glibc 2.31+).
-
-    Layout: op, pad[3], arch, instruction_pointer, stack_pointer, union.
-    PTRACE_GET_SYSCALL_INFO returns the number of bytes filled; the union is
-    only valid for the phase implied by `op`. Reading the wrong side reads
-    garbage and must be avoided.
-    """
-
-    _fields_ = [
-        ("op", ctypes.c_uint8),
-        ("pad", ctypes.c_uint8 * 3),
-        ("arch", ctypes.c_uint32),
-        ("instruction_pointer", ctypes.c_uint64),
-        ("stack_pointer", ctypes.c_uint64),
-        ("u", _SyscallUnion),
-    ]
-
-
 # --------------------------------------------------------------------------- #
 # ExecEvent + policy (ported from ptrace-ism for A/B parity)
 # --------------------------------------------------------------------------- #
@@ -296,18 +192,6 @@ class ExecEvent:
     dirfd: int | None = None
     flags: int | None = None
 
-
-# Descendant-exec deny enforcement: instead of failing the exec with EACCES
-# (which makes the parent shell print a confusing error line), the exec path
-# is replaced with a tiny stub script that silently exits with the canonical
-# deny status 126. The stub lives in /tmp (short name to fit the original
-# path buffer) with owner-only permissions and is created/verified on every
-# deny; when the stub file cannot be created/validated or is longer than the
-# original path buffer, enforcement falls back to the EACCES path-substitution
-# trick -- noisy, but semantics stay the same.
-DENY_STUB_PATH = "/tmp/pd"
-DENY_STUB_CONTENT = b"#!/bin/sh\nexit 126\n"
-DENY_STUB_MODE = 0o700
 
 _deny_rules: dict[str, list[list[str]]] | None = None
 
@@ -529,13 +413,8 @@ def set_options(pid: int) -> None:
     _ptrace(PTRACE_SETOPTIONS, pid, None, ctypes.c_void_p(OPTIONS))
 
 
-def syscall_resume(pid: int, sig: int = 0) -> bool:
-    """Resume a stopped tracee with PTRACE_SYSCALL (deliver optional signal)."""
-    return _ptrace(PTRACE_SYSCALL, pid, None, ctypes.c_void_p(sig)) == 0
-
-
 def cont_resume(pid: int, sig: int = 0) -> bool:
-    """Resume a tracee with PTRACE_CONT (used only after PTRACE_EVENT_EXIT)."""
+    """Resume a stopped tracee, optionally delivering a pending signal."""
     return _ptrace(PTRACE_CONT, pid, None, ctypes.c_void_p(sig)) == 0
 
 
@@ -561,217 +440,6 @@ def get_event_msg(pid: int) -> int:
     return msg.value
 
 
-def get_syscall_info(pid: int) -> SyscallInfo | None:
-    """Fetch PTRACE_GET_SYSCALL_INFO; return None on failure.
-
-    PITFALL: only meaningful for a syscall-stop; call this ONLY for stops where
-    (WSTOPSIG & 0x80) is set. At any other stop the kernel may return garbage.
-    """
-    info = SyscallInfo()
-    size = _ptrace(
-        PTRACE_GET_SYSCALL_INFO,
-        pid,
-        ctypes.c_void_p(ctypes.sizeof(info)),
-        ctypes.byref(info),
-    )
-    if size <= 0:
-        return None
-    return info
-
-
-def get_regs(pid: int) -> UserRegs | None:
-    regs = UserRegs()
-    if _ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(regs)) != 0:
-        return None
-    return regs
-
-
-def set_regs(pid: int, regs: UserRegs) -> bool:
-    return _ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(regs)) == 0
-
-
-# --------------------------------------------------------------------------- #
-# /proc/<tid>/mem I/O. Valid ONLY while the tracee is ptrace-stopped.
-# --------------------------------------------------------------------------- #
-def _open_mem(pid: int):
-    try:
-        return os.open(f"/proc/{pid}/mem", os.O_RDWR)
-    except (OSError, ProcessLookupError):
-        return None
-
-
-def read_cstring(pid: int, addr: int, maxlen: int = 4096) -> str | None:
-    """Read a NUL-terminated C string from the stopped tracee.
-
-    PITFALL: /proc/<tid>/mem reads only work while the tracee is stopped, and it
-    can exit mid-read. Every operation is guarded; on any error we return None
-    (never raise). `addr == 0` means "no pointer" and yields "".
-    """
-    if not addr:
-        return ""
-    fd = _open_mem(pid)
-    if fd is None:
-        return None
-    try:
-        data = bytearray()
-        while len(data) < maxlen:
-            chunk = os.pread(fd, maxlen - len(data), addr + len(data))
-            if not chunk:
-                break
-            nul = chunk.find(b"\0")
-            if nul >= 0:
-                data += chunk[:nul]
-                break
-            data += chunk
-        return bytes(data).decode("utf-8", errors="surrogateescape")
-    except (OSError, OverflowError, ValueError):
-        return None
-    finally:
-        os.close(fd)
-
-
-def read_argv(pid: int, addr: int, max: int = 256) -> list[str] | None:
-    """Read a NULL-terminated argv pointer array from the tracee.
-
-    Same stop-requirement and error-guard caveats as read_cstring.
-    """
-    if not addr:
-        return None
-    fd = _open_mem(pid)
-    if fd is None:
-        return None
-    try:
-        result: list[str] = []
-        for index in range(max):
-            raw = os.pread(fd, 8, addr + index * 8)
-            if len(raw) < 8:
-                break
-            arg_ptr = int.from_bytes(raw, "little", signed=False)
-            if arg_ptr == 0:
-                break
-            arg = read_cstring(pid, arg_ptr)
-            result.append(arg if arg is not None else "<unreadable>")
-        return result
-    except (OSError, OverflowError):
-        return None
-    finally:
-        os.close(fd)
-
-
-def write_mem(pid: int, addr: int, data: bytes) -> bool:
-    """Write `data` at `addr` in the tracee (stopped-only). Returns bool."""
-    if not addr:
-        return False
-    fd = _open_mem(pid)
-    if fd is None:
-        return False
-    try:
-        os.pwrite(fd, data, addr)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
-# --------------------------------------------------------------------------- #
-# Enforcement
-# --------------------------------------------------------------------------- #
-def enforce_deny(
-    pid: int,
-    regs: UserRegs,
-    event: ExecEvent,
-    state: State,
-) -> str:
-    """Fail the denied exec syscall at syscall-entry time.
-
-    Strategy, in order:
-    1. Stub write: overwrite the path pointer's target with the deny stub path
-       so the exec *succeeds* into a silent exit-126 stub instead of failing
-       with EACCES (which would make the parent shell print a confusing error
-       line). Used when the stub is usable and fits in the original path buffer.
-    2. EACCES path rewrite: otherwise replace the path with "/\0" so the kernel
-       resolves "/" and returns -EACCES (noisy, but the deny semantics stay the
-       same).
-    3. ENOSYS syscall-number replacement: if the EACCES memory write itself
-       fails (write_mem returns False), force orig_rax to an invalid syscall
-       number so the kernel returns -ENOSYS.
-
-    Returns "EACCES" when the exec path was rewritten to the deny stub or to
-    "/" (the label does not distinguish the two), "ENOSYS" when the syscall
-    number was replaced, or "failed" if even set_regs failed.
-    """
-    # execve: path in %rdi; execveat: path in %rsi.
-    path_ptr = regs.di if event.syscall == "execve" else regs.si
-
-    if path_ptr:
-        # Replace the exec path with the deny stub when it fits in the original
-        # path buffer and is usable, so the exec *succeeds* into a silent
-        # exit-126 stub instead of failing with EACCES (which would make the
-        # parent shell print a confusing error line). Fall back to the EACCES
-        # path-substitution (b"/\0") otherwise; semantics stay the same.
-        if _ensure_deny_stub(state) and len(DENY_STUB_PATH) <= len(event.path):
-            payload = DENY_STUB_PATH.encode() + b"\0"
-        else:
-            payload = b"/\0"
-        # The tracee is stopped at syscall entry; overwriting the path string
-        # in place makes the kernel see the substituted path when it copies it.
-        if write_mem(pid, path_ptr, payload):
-            trace.debug_log(f"enforce EACCES pid={pid}")
-            return "EACCES"
-        trace.debug_log(f"enforce: EACCES write failed pid={pid}")
-
-    # Fallback: replace the syscall number so the kernel returns ENOSYS.
-    regs.orig_rax = INVALID_SYSCALL_NR
-    regs.rax = INVALID_SYSCALL_NR
-    if set_regs(pid, regs):
-        trace.debug_log(f"enforce ENOSYS pid={pid}")
-        return "ENOSYS"
-
-    trace.debug_log(f"enforce failed pid={pid}")
-    return "failed"
-
-
-def _ensure_deny_stub(state: State) -> bool:
-    """Ensure the deny stub script exists, is ours, and is executable.
-
-    The stub is a tiny shebang script that exits with status 126. Called on
-    every descendant deny; recreates the stub if missing or tampered with.
-    Returns True when the stub is usable (then the exec path can be replaced
-    with it), False otherwise (enforcement falls back to the EACCES
-    path-substitution trick).
-    """
-    try:
-        st = os.stat(DENY_STUB_PATH)
-        if not stat.S_ISREG(st.st_mode) or (st.st_mode & 0o700) != DENY_STUB_MODE:
-            raise OSError("stub exists but is not a usable regular file")
-        with open(DENY_STUB_PATH, "rb") as stream:
-            if stream.read(len(DENY_STUB_CONTENT)) != DENY_STUB_CONTENT:
-                raise OSError("stub content mismatch")
-        return True
-    except OSError as exc:
-        trace.debug_log(f"deny stub {DENY_STUB_PATH} not usable ({exc}); recreating")
-    try:
-        try:
-            os.unlink(DENY_STUB_PATH)
-        except FileNotFoundError:
-            pass
-        fd = os.open(
-            DENY_STUB_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, DENY_STUB_MODE
-        )
-        try:
-            os.write(fd, DENY_STUB_CONTENT)
-        finally:
-            os.close(fd)
-        return True
-    except OSError as exc:
-        trace.debug_log(
-            f"deny stub {DENY_STUB_PATH} recreation failed ({exc}); "
-            "fallback to EACCES path substitution"
-        )
-        return False
-
-
 # --------------------------------------------------------------------------- #
 # Tracee state
 # --------------------------------------------------------------------------- #
@@ -779,7 +447,7 @@ class State:
     def __init__(self) -> None:
         self.traced: set[int] = set()
         # INVARIANT: `traced` NEVER contains a dead pid. An entry is added only
-        # AFTER a successful PTRACE_SYSCALL resume of the child and removed on
+        # AFTER a successful resume of the child and removed on
         # WIFEXITED/WIFSIGNALED reaping (see _record_gone). Because we never add
         # a pid before its successful resume, a child that races through its
         # FULL lifecycle (exec -> event -> exit -> reaped) before the parent's
@@ -787,8 +455,6 @@ class State:
         # keeping the main loop able to terminate.
         self.root = 0
         self.root_exit_code: int | None = None
-        self.root_argv: tuple[str, ...] | None = None
-        self.root_decision: str | None = None
         self.exec_events = 0
         self.denied = 0
         # Deterministic-timeout bookkeeping (see main_loop): start_time is set
@@ -802,75 +468,23 @@ class State:
 # --------------------------------------------------------------------------- #
 # Exec event construction + formatting
 # --------------------------------------------------------------------------- #
-def build_exec(pid: int, nr: int, regs: UserRegs) -> ExecEvent | None:
-    """Read path/argv from regs and build an ExecEvent.
-
-    execve: path=%rdi, argv=%rsi. execveat: path=%rsi, argv=%rdx.
-    If argv is unreadable, argv0 degrades to basename(path) or "?".
-    """
-    if nr == SYS_EXECVE:
-        syscall_name = "execve"
-        path_ptr = regs.di
-        argv_ptr = regs.si
-        dirfd = None
-        flags = None
-    elif nr == SYS_EXECVEAT:
-        syscall_name = "execveat"
-        # dirfd is stored in %rdi as a signed int.
-        raw = regs.di
-        dirfd = raw - (1 << 64) if raw & (1 << 63) else raw
-        path_ptr = regs.si
-        argv_ptr = regs.dx
-        flags = regs.r8
-    else:
-        return None
-
-    path = read_cstring(pid, path_ptr)
-    if path is None:
-        path = ""
-
-    argv_list = read_argv(pid, argv_ptr)
-    if argv_list:
-        argv = tuple(argv_list)
-    else:
-        argv = ()
-
-    # Guarantee argv[0] exists: fall back to basename(path) or "?".
-    if not argv:
-        base = os.path.basename(path) if path else None
-        argv = (base if base else "?",)
-
-    argv0 = argv[0]
-    if argv0 in ("?", "<unreadable>"):
-        argv0 = os.path.basename(path) if path else "?"
-
-    return ExecEvent(
-        pid=pid,
-        syscall=syscall_name,
-        path=path,
-        argv=argv,
-        argv0=argv0,
-        dirfd=dirfd,
-        flags=flags,
-    )
-
-
 def read_exec_event(pid: int) -> ExecEvent:
     """Build an exec event after the kernel has stopped a successful exec.
 
-    PTRACE_EVENT_EXEC and the root TRACEME trap happen before the new program
-    executes user-space instructions. Unlike syscall-entry inspection, this
-    lets the tracer stay on PTRACE_CONT and avoid a stop at every syscall.
+    PTRACE_EVENT_EXEC happens before the new program executes user-space
+    instructions. This lets the tracer stay on PTRACE_CONT and avoid a stop at
+    every syscall.
     """
     try:
         raw_argv = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         raw_argv = b""
+    if raw_argv.endswith(b"\0"):
+        raw_argv = raw_argv[:-1]
     argv = tuple(
         token.decode("utf-8", errors="surrogateescape")
-        for token in raw_argv.rstrip(b"\0").split(b"\0")
-        if token
-    )
+        for token in raw_argv.split(b"\0")
+    ) if raw_argv else ()
     try:
         path = os.readlink(f"/proc/{pid}/exe")
     except OSError:
@@ -954,22 +568,13 @@ def _dispatch_stopped(state: State, pid: int, sig: int, event: int) -> None:
         return
     if event:
         # Unknown ptrace event. Diagnostic only; do NOT blindly resume.
-        # PTRACE_SYSCALL on a not-stopped / already-resumed tracee fails with
+        # PTRACE_CONT on a not-stopped / already-resumed tracee fails with
         # ESRCH/EIO, so logging and skipping is safer than an unguarded resume.
         print(
             f"unknown ptrace event {event} for pid {pid} (not resumed)",
             file=sys.stderr,
             flush=True,
         )
-        return
-
-    # --- group-stop reports (TRACESYSGOOD marks them with the 0x80 bit, e.g.
-    # SIGSTOP|0x80 = 147). Resume with sig=0: the 0x80 bit is synthetic and must
-    # not be delivered as a signal, and this is not a syscall stop. Real signal
-    # delivery stops (sig without 0x80) fall through to the ordinary fallback.
-    if sig & 0x80:
-        cont_resume(pid, sig=0)
-        trace.debug_log(f"group-stop pid={pid}")
         return
 
     # --- creation-stop of a newly auto-attached child whose parent event
@@ -992,11 +597,10 @@ def _on_event_vfork_done(state: State, pid: int) -> None:
     wait_for_vfork_done and now reports its child exec'd or exited.
 
     There is no hold bookkeeping anymore: after PTRACE_EVENT_VFORK we ALWAYS
-    resumed the parent (see _on_event_clone). Resuming with PTRACE_SYSCALL made
+    resumed the parent (see _on_event_clone). Resuming with PTRACE_CONT makes
     the kernel park the parent in wait_for_vfork_done, and this event is the
     kernel delivering "the child is done". The very fact that we received this
-    stop guarantees `pid` is stopped RIGHT NOW, so we MUST always resume it --
-    an unconditional PTRACE_SYSCALL cannot race an already-resumed tracee.
+    stop guarantees `pid` is stopped RIGHT NOW, so we MUST always resume it.
     """
     cont_resume(pid, sig=0)
     trace.debug_log(f"vfork-done pid={pid} resumed")
@@ -1005,9 +609,8 @@ def _on_event_vfork_done(state: State, pid: int) -> None:
 def _on_event_exit(state: State, pid: int) -> None:
     """PTRACE_EVENT_EXIT: read exit code and PTRACE_CONT so the tracee dies.
 
-    PITFALL: after PTRACE_EVENT_EXIT you must PTRACE_CONT (not PTRACE_SYSCALL)
-    to let the tracee reach its zombie state; reaping then happens via waitpid
-    as an ordinary WIFEXITED stop.
+    PTRACE_CONT lets the tracee reach its zombie state; reaping then happens
+    via waitpid as an ordinary WIFEXITED stop.
     """
     code = get_event_msg(pid)
     trace.debug_log(f"event-exit pid={pid} code={code}")
@@ -1021,7 +624,7 @@ def _on_event_clone(state: State, pid: int, event: int) -> None:
     Under a fork/exec storm the new child can run its FULL lifecycle (exec ->
     event -> exit -> reaped) BEFORE the tracer processes this parent stop (both
     events sit in the wait queue; the child's own stop is dispatched first). In
-    that case syscall_resume(newpid) fails with ESRCH and the dead pid must NOT
+    that case cont_resume(newpid) fails with ESRCH and the dead pid must NOT
     be added to `traced`, or the main loop never terminates.
     """
     newpid = get_event_msg(pid)
@@ -1060,7 +663,7 @@ def _on_event_clone(state: State, pid: int, event: int) -> None:
 
     # ALWAYS resume the parent, for every branch (fork/vfork/clone).
     #
-    # VFORK: after PTRACE_EVENT_VFORK, resuming the parent with PTRACE_SYSCALL
+    # VFORK: after PTRACE_EVENT_VFORK, resuming the parent with PTRACE_CONT
     # makes the kernel park it in wait_for_vfork_done until the child execs or
     # exits, then deliver PTRACE_EVENT_VFORK_DONE (whose handler resumes it
     # again). So an arbitrarily late VFORK stop is harmless and needs NO hold
@@ -1074,38 +677,6 @@ def _on_event_exec(state: State, pid: int) -> None:
     state.exec_events += 1
     if _apply_policy(state, pid, event):
         cont_resume(pid, sig=0)
-
-
-def _on_syscall_stop(state: State, pid: int) -> None:
-    """syscall entry/exit stop: inspect execve/execveat at entry, else resume."""
-    info = get_syscall_info(pid)
-    if info is None:
-        trace.debug_log(f"pid={pid} no syscall-info; resuming")
-        syscall_resume(pid)
-        return
-
-    if info.op == PTRACE_SYSCALL_INFO_ENTRY:
-        _on_syscall_entry(state, pid, info)
-        return
-
-    # exit (op==2) and seccomp (op==3) / unknown: nothing to enforce at exit.
-    syscall_resume(pid)
-
-
-def _on_syscall_entry(state: State, pid: int, info: SyscallInfo) -> None:
-    nr = info.u.entry.nr
-    if nr not in (SYS_EXECVE, SYS_EXECVEAT):
-        syscall_resume(pid)
-        return
-
-    regs = get_regs(pid)
-    if regs is None:
-        trace.debug_log(f"pid={pid} getregs failed; resuming")
-        syscall_resume(pid)
-        return
-
-    _handle_exec_entry(state, pid, nr, regs)
-    syscall_resume(pid)
 
 
 def _apply_policy(state: State, pid: int, event: ExecEvent) -> bool:
@@ -1125,77 +696,11 @@ def _apply_policy(state: State, pid: int, event: ExecEvent) -> bool:
     return True
 
 
-def _handle_exec_entry(state: State, pid: int, nr: int, regs: UserRegs) -> None:
-    """Shared execve/execveat entry handling for DESCENDANTS.
-
-    Reads the path and argv from the stopped tracee, applies the policy,
-    enforces a deny at the syscall entry, increments the counters, and logs
-    the exec line. Does NOT resume the tracee: the caller resumes (the root
-    path must apply PTRACE_SETOPTIONS before its resume).
-    """
-    if nr not in (SYS_EXECVE, SYS_EXECVEAT):
-        return
-
-    event = build_exec(pid, nr, regs)
-    if event is None:
-        trace.debug_log(f"pid={pid} build_exec failed; resuming")
-        return
-
-    state.exec_events += 1
-    _apply_policy(state, pid, regs, event)
-
-
 # --------------------------------------------------------------------------- #
 # Launch
 # --------------------------------------------------------------------------- #
-def _root_event_from_argv(
-    state: State, pid: int, nr: int, regs: UserRegs
-) -> ExecEvent | None:
-    """Build the root exec event from the argv the child reported pre-exec.
-
-    The root exec-trap fires when the original argv is no longer readable in
-    the tracee, so we use the exact argv the child passed to os.execvp.
-    Falls back to the memory-based build_exec() if no argv was reported
-    (should not happen; the child always writes the pipe before exec).
-    """
-    argv = state.root_argv
-    if not argv:
-        return build_exec(pid, nr, regs)
-    if nr == SYS_EXECVEAT:
-        syscall = "execveat"
-        raw = regs.di
-        dirfd = raw - (1 << 64) if raw & (1 << 63) else raw
-        flags = regs.r8
-    else:
-        syscall = "execve"
-        dirfd = None
-        flags = None
-    # Display the real path when the tracee memory is still readable at this
-    # stop; otherwise fall back to the typed command (argv[0]).
-    path_ptr = regs.si if nr == SYS_EXECVEAT else regs.di
-    path = read_cstring(pid, path_ptr) or argv[0]
-    return ExecEvent(
-        pid=pid,
-        syscall=syscall,
-        path=path,
-        argv=tuple(argv),
-        argv0=argv[0],
-        dirfd=dirfd,
-        flags=flags,
-    )
-
-
-def _on_root_exec_trap(state: State, pid: int) -> None:
-    """Apply policy at the root's post-exec TRACEME stop."""
-    set_options(pid)
-    event = read_exec_event(pid)
-    state.exec_events += 1
-    if _apply_policy(state, pid, event):
-        cont_resume(pid)
-
-
 def launch(command: str, args: list[str], state: State) -> None:
-    """fork(); child TRACEME + execvp; parent waits for the exec-trap."""
+    """fork(); child TRACEME + execvp; parent waits for the initial stop."""
     state.start_time = time.monotonic()
     pid = os.fork()
     if pid == 0:
@@ -1222,7 +727,7 @@ def launch(command: str, args: list[str], state: State) -> None:
             # The child was already reaped (edge case) and cannot report again.
             # Treat as a launch failure rather than crash.
             print(
-                f"launch: child {pid} was reaped before the exec-trap "
+                f"launch: child {pid} was reaped before the initial stop "
                 "(no child to wait on)",
                 file=sys.stderr,
             )
@@ -1246,7 +751,7 @@ def launch(command: str, args: list[str], state: State) -> None:
         if wpid == pid and os.WIFSIGNALED(status):
             sig = os.WTERMSIG(status)
             print(
-                f"launch: child killed by signal {sig} before exec-trap",
+                f"launch: child killed by signal {sig} before initial stop",
                 file=sys.stderr,
             )
             state.root_exit_code = 128 + sig
